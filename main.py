@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-import math
+import json
 import re
 
 from fastapi import FastAPI
@@ -10,8 +10,8 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="Robot Competition Orchestrator",
-    version="0.2.0",
-    description="智能机器人创意竞赛助手 V2 中央编排器测试接口"
+    version="0.3.0",
+    description="智能机器人创意竞赛助手 V2 中央编排器"
 )
 
 app.add_middleware(
@@ -22,10 +22,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# =========================
-# 数据模型
-# =========================
 
 class ChatRequest(BaseModel):
     session_id: str = Field(..., description="会话ID")
@@ -39,27 +35,17 @@ class ChatResponse(BaseModel):
     stage: str
     intent: str
     message: str
+    payload_json: str = ""
+    download_url: str = ""
     data: Dict[str, Any] = Field(default_factory=dict)
     files: List[Dict[str, Any]] = Field(default_factory=list)
     suggested_actions: List[str] = Field(default_factory=list)
-    version: int = 2
+    version: int = 3
     updated_at: str
 
 
-# =========================
-# 简易会话存储
-# Render 免费版重启后会清空
-# 后续正式版可替换为数据库
-# =========================
-
 SESSION_STORE: Dict[str, Dict[str, Any]] = {}
 
-
-# =========================
-# 内置案例库 v0.2
-# 注意：这里只是调试用的“样例案例库”
-# 后续要替换为真实的往届获奖作品知识库
-# =========================
 
 REFERENCE_CASES = [
     {
@@ -105,10 +91,6 @@ REFERENCE_CASES = [
 ]
 
 
-# =========================
-# 基础工具函数
-# =========================
-
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -117,12 +99,22 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", "", text.strip())
 
 
+def clean_message(text: str) -> str:
+    prefixes = [
+        "启动V2中央编排器",
+        "启动v2中央编排器",
+        "启动机器人竞赛助手",
+        "启动达标版竞赛助手",
+        "运行机器人竞赛中央编排器"
+    ]
+    result = text.strip()
+    for p in prefixes:
+        result = result.replace(p, "").strip()
+    return result if result else text.strip()
+
+
 def contains_any(text: str, words: List[str]) -> bool:
     return any(w in text for w in words)
-
-
-def keyword_hit_count(text: str, words: List[str]) -> int:
-    return sum(1 for w in words if w in text)
 
 
 def clamp(value: float, low: float = 0, high: float = 100) -> float:
@@ -136,10 +128,6 @@ def jaccard_similarity(a: List[str], b: List[str]) -> float:
         return 0.0
     return len(set_a & set_b) / len(set_a | set_b)
 
-
-# =========================
-# 创意字段提取
-# =========================
 
 def extract_idea_fields(raw_idea: str) -> Dict[str, Any]:
     text = normalize_text(raw_idea)
@@ -168,7 +156,6 @@ def extract_idea_fields(raw_idea: str) -> Dict[str, Any]:
     if not scenarios:
         scenarios.append("通用服务场景")
 
-    functions = []
     function_map = {
         "提醒吃药": ["吃药", "服药", "用药", "药物提醒"],
         "跌倒检测": ["跌倒", "摔倒"],
@@ -182,14 +169,13 @@ def extract_idea_fields(raw_idea: str) -> Dict[str, Any]:
         "机械执行": ["机械臂", "抓取", "递送", "搬运"]
     }
 
+    functions = []
     for func, keys in function_map.items():
         if contains_any(text, keys):
             functions.append(func)
-
     if not functions:
         functions.append("基础人机交互")
 
-    tech_modules = []
     tech_map = {
         "语音识别与自然语言交互": ["语音", "聊天", "对话"],
         "多传感器环境感知": ["传感器", "环境", "温湿度", "烟雾", "空气"],
@@ -200,10 +186,10 @@ def extract_idea_fields(raw_idea: str) -> Dict[str, Any]:
         "远程通信与报警": ["远程", "报警", "通知", "家属"]
     }
 
+    tech_modules = []
     for module, keys in tech_map.items():
         if contains_any(text, keys):
             tech_modules.append(module)
-
     if not tech_modules:
         tech_modules.append("基础传感器采集与人机交互模块")
 
@@ -214,7 +200,6 @@ def extract_idea_fields(raw_idea: str) -> Dict[str, Any]:
     ]:
         if word in text:
             keywords.append(word)
-
     if not keywords:
         keywords = functions[:3]
 
@@ -228,12 +213,8 @@ def extract_idea_fields(raw_idea: str) -> Dict[str, Any]:
     }
 
 
-# =========================
-# 相似度与评分
-# =========================
-
 def find_most_similar_case(keywords: List[str]) -> Dict[str, Any]:
-    best_case = None
+    best_case = REFERENCE_CASES[0]
     best_score = 0.0
 
     for case in REFERENCE_CASES:
@@ -241,9 +222,6 @@ def find_most_similar_case(keywords: List[str]) -> Dict[str, Any]:
         if score > best_score:
             best_score = score
             best_case = case
-
-    if best_case is None:
-        best_case = REFERENCE_CASES[0]
 
     return {
         "title": best_case["title"],
@@ -263,24 +241,20 @@ def score_candidate(fields: Dict[str, Any], candidate_index: int) -> Dict[str, A
     function_count = len(functions)
     tech_count = len(tech_modules)
 
-    # 四项基础评分
     innovation_score = 70 + min(12, function_count * 3) + candidate_index * 2
     scientific_score = 68 + min(16, tech_count * 3) + candidate_index
     application_score = 72 + min(12, len(fields["target_groups"]) * 4) + min(8, len(fields["scenarios"]) * 3)
     expression_score = 70 + min(15, len(keywords) * 2)
 
-    # 同质化与相似度惩罚
     similarity_penalty = highest_similarity * 18
     homogeneity_penalty = 8 if highest_similarity >= 0.45 else 3 if highest_similarity >= 0.25 else 0
 
-    # 可实现性惩罚：功能太多但技术模块不足时惩罚
     feasibility_penalty = 0
     if function_count >= 6 and tech_count <= 3:
         feasibility_penalty = 8
     elif function_count >= 5 and tech_count <= 2:
         feasibility_penalty = 12
 
-    # 资料完整度
     completeness_items = 0
     completeness_items += 1 if fields["target_groups"] else 0
     completeness_items += 1 if fields["scenarios"] else 0
@@ -288,7 +262,6 @@ def score_candidate(fields: Dict[str, Any], candidate_index: int) -> Dict[str, A
     completeness_items += 1 if fields["tech_modules"] else 0
     data_completeness_bonus = completeness_items * 1.5
 
-    # 差异化创新加分
     differentiation_bonus = 0
     if contains_any("".join(functions + tech_modules), ["多传感器", "姿态", "物联网", "路径规划"]):
         differentiation_bonus += 4
@@ -304,8 +277,14 @@ def score_candidate(fields: Dict[str, Any], candidate_index: int) -> Dict[str, A
         + expression_score * 0.10
     )
 
-    competitiveness_score = base_total - similarity_penalty - homogeneity_penalty - feasibility_penalty + data_completeness_bonus + differentiation_bonus
-    competitiveness_score = clamp(competitiveness_score)
+    competitiveness_score = (
+        base_total
+        - similarity_penalty
+        - homogeneity_penalty
+        - feasibility_penalty
+        + data_completeness_bonus
+        + differentiation_bonus
+    )
 
     return {
         "innovation_score": round(clamp(innovation_score), 1),
@@ -320,7 +299,7 @@ def score_candidate(fields: Dict[str, Any], candidate_index: int) -> Dict[str, A
         "feasibility_penalty": round(feasibility_penalty, 1),
         "data_completeness_bonus": round(data_completeness_bonus, 1),
         "differentiation_bonus": round(differentiation_bonus, 1),
-        "competitiveness_score": round(competitiveness_score, 1)
+        "competitiveness_score": round(clamp(competitiveness_score), 1)
     }
 
 
@@ -343,13 +322,13 @@ def generate_candidates(fields: Dict[str, Any]) -> List[Dict[str, Any]]:
         {
             "id": 2,
             "title": f"“安居守护者”——基于多模态感知的{target}健康监护机器人",
-            "positioning": f"突出健康监测、异常识别和远程通知，适合做成完整竞赛方案。",
+            "positioning": "突出健康监测、异常识别和远程通知，适合做成完整竞赛方案。",
             "core_tech": tech_short
         },
         {
             "id": 3,
             "title": f"“慧联家护”——融合智能家居联动的{target}主动服务机器人",
-            "positioning": f"突出人机交互、环境感知与智能家居联动，展示性较强。",
+            "positioning": "突出人机交互、环境感知与智能家居联动，展示性较强。",
             "core_tech": tech_short
         }
     ]
@@ -358,41 +337,6 @@ def generate_candidates(fields: Dict[str, Any]) -> List[Dict[str, Any]]:
         candidate["scores"] = score_candidate(fields, idx)
 
     return candidates
-
-
-# =========================
-# 意图识别与回复生成
-# =========================
-
-def detect_intent(message: str, session: Dict[str, Any]) -> str:
-    text = normalize_text(message)
-
-    if contains_any(text, ["重新生成", "重生成", "再生成", "换一批", "不满意"]):
-        return "regenerate_titles"
-
-    if re.fullmatch(r"[123]", text) or contains_any(text, ["选1", "选2", "选3", "第一个", "第二个", "第三个"]):
-        return "select_title"
-
-    if contains_any(text, ["生成报告", "写报告", "生成word", "导出word"]):
-        return "generate_report"
-
-    if "raw_idea" not in session:
-        return "create_project"
-
-    return "supplement_idea"
-
-
-def parse_selection(message: str) -> Optional[int]:
-    text = normalize_text(message)
-
-    if text == "1" or "选1" in text or "第一个" in text:
-        return 1
-    if text == "2" or "选2" in text or "第二个" in text:
-        return 2
-    if text == "3" or "选3" in text or "第三个" in text:
-        return 3
-
-    return None
 
 
 def format_candidate_message(fields: Dict[str, Any], candidates: List[Dict[str, Any]], prefix: str) -> str:
@@ -432,16 +376,360 @@ def format_candidate_message(fields: Dict[str, Any], candidates: List[Dict[str, 
 
     lines.append("")
     lines.append("说明：这里的“获奖竞争力预测”不是获奖概率，而是基于公式的可解释竞争力评分。")
-    lines.append("当前v0.2使用内置样例案例库进行相似度测试；后续接入真实往届获奖作品知识库后，会替换为真实案例对比。")
+    lines.append("当前v0.3使用内置样例案例库进行相似度测试；后续接入真实往届获奖作品知识库后，会替换为真实案例对比。")
     lines.append("")
     lines.append("请选择：输入 1、2、3 确认题目；输入“重新生成”换一批；或直接补充你的要求。")
 
     return "\n".join(lines)
 
 
+def build_report_json(fields: Dict[str, Any], selected: Dict[str, Any]) -> Dict[str, Any]:
+    title = selected["title"]
+    scores = selected["scores"]
+
+    target = "、".join(fields.get("target_groups", []))
+    scenario = "、".join(fields.get("scenarios", []))
+    core_functions = fields.get("core_functions", [])
+    tech_modules = fields.get("tech_modules", [])
+    keywords = fields.get("keywords", [])
+
+    function_text = "、".join(core_functions)
+    technology_text = "、".join(tech_modules)
+
+    def image_spec(image_type: str, purpose: str, prompt: str) -> Dict[str, Any]:
+        return {
+            "required": True,
+            "image_type": image_type,
+            "purpose": purpose,
+            "prompt": prompt,
+            "aspect_ratio": "16:9",
+            "file_url": "",
+            "generation_status": "pending"
+        }
+
+    report = {
+        "schema_version": "robot-competition-report-v0.3",
+        "project_title": title,
+        "revision": 1,
+        "generated_at": now_iso(),
+        "competition_prediction": {
+            "name": "获奖竞争力预测",
+            "score": scores.get("competitiveness_score", 0),
+            "base_total": scores.get("base_total", 0),
+            "innovation_score": scores.get("innovation_score", 0),
+            "scientific_score": scores.get("scientific_score", 0),
+            "application_score": scores.get("application_score", 0),
+            "expression_score": scores.get("expression_score", 0),
+            "highest_similarity": scores.get("highest_similarity", 0),
+            "similar_case": scores.get("similar_case", {}),
+            "similarity_penalty": scores.get("similarity_penalty", 0),
+            "homogeneity_penalty": scores.get("homogeneity_penalty", 0),
+            "feasibility_penalty": scores.get("feasibility_penalty", 0),
+            "data_completeness_bonus": scores.get("data_completeness_bonus", 0),
+            "differentiation_bonus": scores.get("differentiation_bonus", 0),
+            "disclaimer": "该数值是基于固定公式计算的获奖竞争力预测，不是实际获奖概率。"
+        },
+        "project_fields": {
+            "target_groups": fields.get("target_groups", []),
+            "scenarios": fields.get("scenarios", []),
+            "core_functions": core_functions,
+            "tech_modules": tech_modules,
+            "keywords": keywords
+        },
+        "pages": {
+            "page_1": {
+                "page_no": 1,
+                "module": "封面",
+                "title": title,
+                "subtitle": "智能机器人创意竞赛项目报告",
+                "content": {
+                    "competition_name": "智能机器人创意竞赛",
+                    "project_name": title,
+                    "track": "服务机器人赛道（待根据竞赛规则确认）",
+                    "keywords": keywords,
+                    "team_name": "待填写",
+                    "school_name": "待填写",
+                    "members": "待填写",
+                    "advisor": "待填写",
+                    "date": "待填写"
+                },
+                "image": {
+                    "required": False,
+                    "image_type": "封面背景",
+                    "purpose": "由固定Word模板完成封面设计",
+                    "prompt": "",
+                    "aspect_ratio": "A4",
+                    "file_url": "",
+                    "generation_status": "not_required"
+                }
+            },
+            "page_2": {
+                "page_no": 2,
+                "module": "设计背景",
+                "title": "设计背景",
+                "content": {
+                    "summary": f"本项目面向{target}，重点服务于{scenario}，围绕{function_text}等需求设计智能机器人。",
+                    "user_pain_points": [
+                        "目标用户可能面临持续照护资源不足的问题。",
+                        "传统单一设备之间缺乏统一感知、决策和联动能力。",
+                        "异常事件发生后，信息通知和应急响应可能不及时。",
+                        "现有产品在适老化交互和长期陪伴方面仍有改进空间。"
+                    ],
+                    "design_objectives": [
+                        f"为{target}提供低门槛、易操作的人机交互方式。",
+                        f"实现{function_text}等核心功能的闭环服务。",
+                        "提高异常事件识别、主动提醒与远程联动能力。",
+                        "保证方案具备可实现性、可扩展性和竞赛展示性。"
+                    ],
+                    "evidence_requirements": [
+                        "正式版本必须从竞赛规则知识库提取参赛约束。",
+                        "必须引用真实往届获奖作品进行差异化分析。",
+                        "不得虚构市场规模、用户数量或获奖概率。"
+                    ]
+                },
+                "image": image_spec(
+                    "用户痛点场景图",
+                    "展示目标用户在真实使用场景中的核心痛点",
+                    f"绘制一张面向{target}的{scenario}需求场景图，体现{function_text}相关痛点，科技竞赛报告风格。"
+                )
+            },
+            "page_3": {
+                "page_no": 3,
+                "module": "产品整体结构",
+                "title": "产品整体结构",
+                "content": {
+                    "architecture_summary": "系统采用感知层、通信层、决策层、执行层和应用层组成的分层架构。",
+                    "hardware_structure": [
+                        "机器人主体或移动底盘",
+                        "环境与人体状态感知传感器",
+                        "语音交互模块",
+                        "边缘计算控制器",
+                        "无线通信与物联网模块",
+                        "声光提醒及必要的执行机构"
+                    ],
+                    "software_structure": tech_modules,
+                    "data_flow": [
+                        "传感器采集用户与环境信息",
+                        "边缘端进行数据清洗和初步识别",
+                        "决策模块判断用户需求与异常状态",
+                        "执行模块完成提醒、联动或报警",
+                        "结果反馈至用户、家属或管理平台"
+                    ],
+                    "external_interfaces": [
+                        "智能家居设备接口",
+                        "移动端或家属端接口",
+                        "云端数据管理接口",
+                        "紧急联系人通知接口"
+                    ]
+                },
+                "image": image_spec(
+                    "产品总体结构图",
+                    "展示机器人软硬件总体组成及模块连接关系",
+                    f"生成{title}的产品总体结构图，包含感知层、决策层、执行层、通信层和应用层。"
+                )
+            },
+            "page_4": {
+                "page_no": 4,
+                "module": "软硬件功能设计",
+                "title": "软硬件功能设计",
+                "content": {
+                    "core_functions": core_functions,
+                    "function_modules": [
+                        {
+                            "module_name": function_name,
+                            "input": "传感器数据或用户指令",
+                            "processing": "状态识别、规则判断或智能决策",
+                            "output": "提醒、反馈、联动、报警或执行动作"
+                        }
+                        for function_name in core_functions
+                    ],
+                    "hardware_design_principles": [
+                        "传感器选择应与实际识别任务对应。",
+                        "核心功能应尽量支持离线或边缘端运行。",
+                        "重要异常事件应设计冗余检测机制。",
+                        "结构设计应考虑安全、稳定和适老化使用。"
+                    ],
+                    "software_design_principles": [
+                        "采用模块化软件架构，便于单独测试和升级。",
+                        "对用户信息设置权限控制和隐私保护。",
+                        "为不同用户保留可配置的提醒和交互参数。",
+                        "保留运行日志，支持故障定位和功能评估。"
+                    ]
+                },
+                "image": image_spec(
+                    "软硬件功能框图",
+                    "展示各传感器、控制器和软件模块之间的关系",
+                    f"绘制{title}的软硬件功能框图，突出{function_text}，展示传感器、控制器、通信模块和执行模块。"
+                )
+            },
+            "page_5": {
+                "page_no": 5,
+                "module": "关键技术",
+                "title": "关键技术",
+                "content": {
+                    "key_technologies": tech_modules,
+                    "technical_route": [
+                        {
+                            "technology": technology,
+                            "role": "支撑机器人感知、理解、决策或执行功能",
+                            "verification": "通过模块测试、场景测试和系统联调验证"
+                        }
+                        for technology in tech_modules
+                    ],
+                    "implementation_focus": [
+                        "明确每项算法的输入、输出和运行位置。",
+                        "优先采用可以在现有硬件上实现的成熟技术。",
+                        "对关键识别模块设置准确率、延迟和稳定性指标。",
+                        "建立异常情况和传感器失效时的降级策略。"
+                    ],
+                    "risk_control": [
+                        "避免将概念性功能描述为已经完全实现。",
+                        "明确原型验证与最终产品之间的差异。",
+                        "对涉及健康和安全的判断增加人工确认机制。",
+                        "保护用户音频、图像和健康数据。"
+                    ]
+                },
+                "image": image_spec(
+                    "关键技术流程图",
+                    "展示从数据采集到决策执行的技术路线",
+                    f"生成{title}的关键技术流程图，核心技术包括{technology_text}，按采集、识别、决策、执行、反馈顺序展示。"
+                )
+            },
+            "page_6": {
+                "page_no": 6,
+                "module": "项目创新点",
+                "title": "项目创新点",
+                "content": {
+                    "innovation_points": [
+                        {
+                            "name": "多功能闭环融合",
+                            "description": f"将{function_text}整合到同一机器人系统中，形成感知、判断、执行和反馈闭环。"
+                        },
+                        {
+                            "name": "主动服务模式",
+                            "description": "由被动响应升级为主动识别需求、主动提醒和主动联动。"
+                        },
+                        {
+                            "name": "适老化人机交互",
+                            "description": "通过自然语音、大字体、低层级操作和异常自动反馈降低使用门槛。"
+                        },
+                        {
+                            "name": "可解释竞争力分析",
+                            "description": "采用创新性、科学性、应用前景和设计表达加权评分，并加入同质化与可实现性惩罚。"
+                        }
+                    ],
+                    "differentiation_analysis": {
+                        "similar_case": scores.get("similar_case", {}),
+                        "highest_similarity": scores.get("highest_similarity", 0),
+                        "homogeneity_penalty": scores.get("homogeneity_penalty", 0),
+                        "differentiation_bonus": scores.get("differentiation_bonus", 0),
+                        "note": "当前相似度数据来自样例案例库，正式版本必须替换为真实往届获奖作品数据。"
+                    }
+                },
+                "image": image_spec(
+                    "创新点对比图",
+                    "对比本方案与传统单功能设备之间的差异",
+                    f"制作{title}的创新点对比信息图，突出多模态感知、主动服务、智能家居联动和适老化交互。"
+                )
+            },
+            "page_7": {
+                "page_no": 7,
+                "module": "行业应用前景",
+                "title": "行业应用前景",
+                "content": {
+                    "application_scenarios": fields.get("scenarios", []),
+                    "target_users": fields.get("target_groups", []),
+                    "deployment_paths": [
+                        "家庭独立使用",
+                        "社区养老服务站部署",
+                        "养老机构辅助照护",
+                        "与智能家居厂商联合部署",
+                        "与健康管理平台进行接口对接"
+                    ],
+                    "social_value": [
+                        "降低高频、重复性基础照护工作的压力。",
+                        "提升异常事件发现和通知效率。",
+                        "改善目标用户居家生活的安全感和便利性。",
+                        "为社区和家庭提供可扩展的智能照护入口。"
+                    ],
+                    "commercialization_path": [
+                        "首先完成核心功能原型和场景验证。",
+                        "根据真实用户反馈迭代硬件与交互设计。",
+                        "形成基础版、家庭联动版和机构服务版。",
+                        "逐步建设设备管理、数据服务和售后体系。"
+                    ],
+                    "future_iterations": [
+                        "增加更丰富的生命体征检测设备接口。",
+                        "优化多用户身份识别和个性化交互能力。",
+                        "扩展更多智能家居协议。",
+                        "引入长期使用数据评估与持续学习机制。"
+                    ]
+                },
+                "image": image_spec(
+                    "行业应用生态图",
+                    "展示家庭、社区、养老机构与服务平台的应用生态",
+                    f"生成{title}的行业应用生态图，中心为机器人，周围连接家庭、社区、养老机构、家属移动端、智能家居和健康服务平台。"
+                )
+            }
+        },
+        "image_plan": {
+            "total_images": 6,
+            "pages": [2, 3, 4, 5, 6, 7],
+            "status": "pending"
+        },
+        "word_export": {
+            "template_name": "robot_competition_report_v1",
+            "page_count": 7,
+            "status": "pending",
+            "file_url": ""
+        },
+        "revision_history": [
+            {
+                "revision": 1,
+                "action": "initial_generation",
+                "updated_pages": [1, 2, 3, 4, 5, 6, 7],
+                "updated_at": now_iso()
+            }
+        ]
+    }
+
+    return report
+
+
+def detect_intent(message: str, session: Dict[str, Any]) -> str:
+    text = normalize_text(message)
+
+    if contains_any(text, ["重新生成", "重生成", "再生成", "换一批", "不满意"]):
+        return "regenerate_titles"
+
+    if re.fullmatch(r"[123]", text) or contains_any(text, ["选1", "选2", "选3", "第一个", "第二个", "第三个"]):
+        return "select_title"
+
+    if contains_any(text, ["生成报告", "写报告", "生成word", "导出word", "报告"]):
+        return "generate_report"
+
+    if "raw_idea" not in session:
+        return "create_project"
+
+    return "supplement_idea"
+
+
+def parse_selection(message: str) -> Optional[int]:
+    text = normalize_text(message)
+
+    if text == "1" or "选1" in text or "第一个" in text:
+        return 1
+    if text == "2" or "选2" in text or "第二个" in text:
+        return 2
+    if text == "3" or "选3" in text or "第三个" in text:
+        return 3
+
+    return None
+
+
 def handle_chat(req: ChatRequest) -> ChatResponse:
     session = SESSION_STORE.setdefault(req.session_id, {})
-    user_message = req.message.strip()
+    user_message = clean_message(req.message)
     intent = detect_intent(user_message, session)
 
     if intent in ["create_project", "supplement_idea", "regenerate_titles"]:
@@ -464,16 +752,19 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
         session["candidates"] = candidates
         session["stage"] = "candidates_ready"
 
+        payload = {
+            "fields": fields,
+            "candidates": candidates,
+            "current_stage": "candidates_ready"
+        }
+
         return ChatResponse(
             success=True,
             stage="candidates_ready",
             intent=intent,
             message=format_candidate_message(fields, candidates, prefix),
-            data={
-                "fields": fields,
-                "candidates": candidates,
-                "current_stage": "candidates_ready"
-            },
+            payload_json=json.dumps(payload, ensure_ascii=False, indent=2),
+            data=payload,
             files=[],
             suggested_actions=["输入1/2/3选择题目", "重新生成", "补充要求"],
             updated_at=now_iso()
@@ -515,7 +806,7 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             f"已确认最终题目：\n\n"
             f"{selected['title']}\n\n"
             f"该题目的获奖竞争力预测为：{selected['scores']['competitiveness_score']} / 100。\n\n"
-            f"下一步可以输入“生成报告”，系统将生成结构化7页报告JSON。"
+            f"下一步可以输入“生成报告”，系统将生成严格固定为7页的结构化报告JSON。"
         )
 
         return ChatResponse(
@@ -523,10 +814,8 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             stage="title_confirmed",
             intent="select_title",
             message=msg,
-            data={
-                "selected_title": selected,
-                "current_stage": "title_confirmed"
-            },
+            payload_json=json.dumps({"selected_title": selected}, ensure_ascii=False, indent=2),
+            data={"selected_title": selected, "current_stage": "title_confirmed"},
             files=[],
             suggested_actions=["生成报告", "重新生成题目", "补充要求"],
             updated_at=now_iso()
@@ -541,38 +830,34 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
                 success=False,
                 stage="report_failed",
                 intent="generate_report",
-                message="还没有确认最终题目。请先输入 1、2 或 3 选择一个候选题目。",
+                message="还没有确认最终题目。请先输入1、2或3选择一个候选题目。",
                 data={},
                 files=[],
                 suggested_actions=["输入1", "输入2", "输入3"],
                 updated_at=now_iso()
             )
 
-        report_json = {
-            "page_1": "封面：作品名称、参赛方向、团队信息、关键词",
-            "page_2": "设计背景：用户痛点、现实需求、竞赛价值",
-            "page_3": "产品整体结构：硬件结构、软件架构、交互流程",
-            "page_4": "软硬件功能设计：传感器、执行器、通信模块与功能闭环",
-            "page_5": "关键技术：算法、控制、感知、数据处理与安全策略",
-            "page_6": "项目创新点：差异化设计、技术创新、应用创新",
-            "page_7": "行业应用前景：推广场景、社会价值、商业化与迭代方向"
-        }
+        report_json = build_report_json(fields, selected)
+        report_json_text = json.dumps(report_json, ensure_ascii=False, indent=2)
 
         session["report_json"] = report_json
+        session["report_revision"] = 1
         session["stage"] = "report_json_ready"
 
         msg = (
-            f"已基于最终题目生成结构化7页报告JSON框架。\n\n"
+            "已生成严格固定为7页的结构化报告JSON。\n\n"
             f"最终题目：{selected['title']}\n\n"
-            f"报告结构：\n"
-            f"1. 封面\n"
-            f"2. 设计背景\n"
-            f"3. 产品整体结构\n"
-            f"4. 软硬件功能设计\n"
-            f"5. 关键技术\n"
-            f"6. 项目创新点\n"
-            f"7. 行业应用前景\n\n"
-            f"下一版将继续加入：6张配图生成、固定模板排版、Word文件导出、指定页面局部修改。"
+            "报告页序：\n"
+            "1. 封面\n"
+            "2. 设计背景\n"
+            "3. 产品整体结构\n"
+            "4. 软硬件功能设计\n"
+            "5. 关键技术\n"
+            "6. 项目创新点\n"
+            "7. 行业应用前景\n\n"
+            "第2页至第7页已分别生成一条配图指令，共6张配图。\n"
+            "权威结构化数据保存在 payload_json 字段中。\n\n"
+            "下一步：生成6张配图并导出固定七页Word文件。"
         )
 
         return ChatResponse(
@@ -580,12 +865,15 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             stage="report_json_ready",
             intent="generate_report",
             message=msg,
+            payload_json=report_json_text,
+            download_url="",
             data={
                 "report_json": report_json,
-                "current_stage": "report_json_ready"
+                "current_stage": "report_json_ready",
+                "revision": 1
             },
             files=[],
-            suggested_actions=["生成配图", "导出Word", "修改第3页"],
+            suggested_actions=["生成6张配图", "导出Word", "修改第2页"],
             updated_at=now_iso()
         )
 
@@ -601,16 +889,12 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
     )
 
 
-# =========================
-# API
-# =========================
-
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {
         "status": "ok",
         "service": "robot_competition_orchestrator",
-        "version": "0.2.0"
+        "version": "0.3.0"
     }
 
 
