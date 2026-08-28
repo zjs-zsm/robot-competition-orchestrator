@@ -811,7 +811,7 @@ def parse_selection(message: str) -> Optional[int]:
 
 
 def handle_chat(req: ChatRequest) -> ChatResponse:
-    session_key = "chaoxing-robot-competition-demo"
+    session_key = f"{req.user_id}:{req.session_id}"
     session = SESSION_STORE.setdefault(session_key, {})
 
     user_message = clean_message(req.message)
