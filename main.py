@@ -2,13 +2,22 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import json
 import re
+import os
+import hashlib
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.section import WD_SECTION
+from docx.shared import Cm, Pt
+from docx.oxml.ns import qn
 
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 
 app = FastAPI(
     title="Robot Competition Orchestrator",
@@ -47,6 +56,13 @@ class ChatResponse(BaseModel):
 
 
 SESSION_STORE: Dict[str, Dict[str, Any]] = {}
+
+EXPORT_DIR = Path(os.getenv("EXPORT_DIR", "/tmp/robot_competition_exports"))
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL",
+    "https://robot-competition-orchestrator.onrender.com"
+).rstrip("/")
 
 
 # 当前仍是“样例案例库”。
@@ -821,9 +837,251 @@ def format_report_summary(report_json: Dict[str, Any]) -> str:
         "6. 项目创新点与差异化分析\n"
         "7. 行业应用前景与落地路径\n\n"
         "本版已经强化：机器人闭环、工程指标、风险控制、差异化分析和图示规划。\n"
-        "结构化数据保存在 payload_json 中。\n\n"
+        "结构化数据保存在 payload_json 中。\n"
+        "输入‘生成Word’即可导出可下载的 .docx 报告。\n\n"
         "下一阶段：接入真实往届获奖作品知识库，再把样例相似度替换为真实案例对比。"
     )
+
+
+
+def _set_run_font(run, size: float = 10.0, bold: bool = False) -> None:
+    run.font.name = "Microsoft YaHei"
+    run._element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
+    run.font.size = Pt(size)
+    run.font.bold = bold
+
+
+def _add_paragraph(
+    doc: Document,
+    text: str = "",
+    size: float = 10.0,
+    bold: bool = False,
+    align: Optional[int] = None,
+    space_after: float = 3.0
+):
+    p = doc.add_paragraph()
+    if align is not None:
+        p.alignment = align
+    p.paragraph_format.space_after = Pt(space_after)
+    p.paragraph_format.line_spacing = 1.05
+    run = p.add_run(str(text))
+    _set_run_font(run, size=size, bold=bold)
+    return p
+
+
+def _add_heading(doc: Document, text: str, level: int = 1) -> None:
+    size_map = {1: 15.0, 2: 11.5, 3: 10.5}
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(2)
+    p.paragraph_format.space_after = Pt(3)
+    run = p.add_run(text)
+    _set_run_font(run, size=size_map.get(level, 10.5), bold=True)
+
+
+def _add_bullets(doc: Document, items: List[Any], limit: int = 6) -> None:
+    for item in (items or [])[:limit]:
+        if isinstance(item, dict):
+            if "name" in item and "description" in item:
+                text = f"{item.get('name')}：{item.get('description')}"
+            elif "module_name" in item:
+                text = (
+                    f"{item.get('module_name')}：输入—{item.get('input', '')}；"
+                    f"处理—{item.get('processing', '')}；输出—{item.get('output', '')}"
+                )
+            elif "technology" in item:
+                text = (
+                    f"{item.get('technology')}：{item.get('role', '')}；"
+                    f"验证—{item.get('verification', '')}"
+                )
+            else:
+                text = "；".join(f"{k}：{v}" for k, v in list(item.items())[:3])
+        else:
+            text = str(item)
+
+        p = doc.add_paragraph(style=None)
+        p.paragraph_format.left_indent = Cm(0.45)
+        p.paragraph_format.first_line_indent = Cm(-0.25)
+        p.paragraph_format.space_after = Pt(1.5)
+        p.paragraph_format.line_spacing = 1.0
+        run = p.add_run("• " + text)
+        _set_run_font(run, size=9.4)
+
+
+def _add_key_value(doc: Document, key: str, value: Any, size: float = 9.6) -> None:
+    if value is None or value == "":
+        return
+    if isinstance(value, list):
+        value = "、".join(str(x) for x in value)
+    p = doc.add_paragraph()
+    p.paragraph_format.space_after = Pt(1.5)
+    p.paragraph_format.line_spacing = 1.0
+    r1 = p.add_run(f"{key}：")
+    _set_run_font(r1, size=size, bold=True)
+    r2 = p.add_run(str(value))
+    _set_run_font(r2, size=size)
+
+
+def _prepare_document() -> Document:
+    doc = Document()
+    section = doc.sections[0]
+    section.top_margin = Cm(1.35)
+    section.bottom_margin = Cm(1.25)
+    section.left_margin = Cm(1.45)
+    section.right_margin = Cm(1.45)
+
+    normal = doc.styles["Normal"]
+    normal.font.name = "Microsoft YaHei"
+    normal._element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
+    normal.font.size = Pt(9.6)
+    return doc
+
+
+def _add_footer(section, page_no: int) -> None:
+    section.footer.is_linked_to_previous = False
+    p = section.footer.paragraphs[0]
+    p.clear()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run(f"智能机器人创新竞赛项目报告 · 第 {page_no} 页")
+    _set_run_font(run, size=8.0)
+
+
+def _new_page_section(doc: Document, page_no: int):
+    if page_no == 1:
+        section = doc.sections[0]
+    else:
+        section = doc.add_section(WD_SECTION.NEW_PAGE)
+        section.top_margin = Cm(1.35)
+        section.bottom_margin = Cm(1.25)
+        section.left_margin = Cm(1.45)
+        section.right_margin = Cm(1.45)
+    _add_footer(section, page_no)
+    return section
+
+
+def _render_report_page(doc: Document, report_json: Dict[str, Any], page_no: int) -> None:
+    page = report_json.get("pages", {}).get(f"page_{page_no}", {})
+    content = page.get("content", {})
+    title = page.get("title", f"第{page_no}页")
+
+    if page_no == 1:
+        _add_paragraph(doc, "智能机器人创新竞赛", 13, True, WD_ALIGN_PARAGRAPH.CENTER, 8)
+        _add_paragraph(doc, report_json.get("project_title", title), 19, True, WD_ALIGN_PARAGRAPH.CENTER, 10)
+        _add_paragraph(doc, page.get("subtitle", "智能机器人创新竞赛项目报告"), 12, False, WD_ALIGN_PARAGRAPH.CENTER, 18)
+        _add_key_value(doc, "设计理念", content.get("design_concept"), 10.2)
+        _add_key_value(doc, "关键词", content.get("keywords"), 10.2)
+        _add_key_value(doc, "赛道", content.get("track"), 10.2)
+        _add_key_value(doc, "团队", content.get("team_name"), 10.2)
+        _add_key_value(doc, "学校", content.get("school_name"), 10.2)
+        _add_key_value(doc, "成员", content.get("members"), 10.2)
+        _add_key_value(doc, "指导教师", content.get("advisor"), 10.2)
+        prediction = report_json.get("competition_prediction", {})
+        _add_paragraph(
+            doc,
+            f"获奖竞争力预测：{prediction.get('score', 0)} / 100",
+            12,
+            True,
+            WD_ALIGN_PARAGRAPH.CENTER,
+            4,
+        )
+        _add_paragraph(doc, prediction.get("disclaimer", ""), 8.5, False, WD_ALIGN_PARAGRAPH.CENTER, 2)
+        return
+
+    _add_heading(doc, f"{page_no}. {title}", 1)
+
+    if page_no == 2:
+        _add_key_value(doc, "项目概述", content.get("summary"))
+        _add_heading(doc, "用户痛点", 2)
+        _add_bullets(doc, content.get("user_pain_points", []), 4)
+        _add_heading(doc, "设计目标", 2)
+        _add_bullets(doc, content.get("design_objectives", []), 4)
+        _add_heading(doc, "证据边界", 2)
+        _add_bullets(doc, content.get("evidence_requirements", []), 3)
+
+    elif page_no == 3:
+        _add_key_value(doc, "总体架构", content.get("architecture_summary"))
+        _add_heading(doc, "硬件组成", 2)
+        _add_bullets(doc, content.get("hardware_structure", []), 6)
+        loop = content.get("robot_closed_loop", {})
+        _add_heading(doc, "机器人闭环", 2)
+        _add_key_value(doc, "感知", loop.get("sense"))
+        _add_key_value(doc, "决策", loop.get("decide"))
+        _add_key_value(doc, "执行", loop.get("act"))
+        _add_key_value(doc, "反馈", loop.get("feedback"))
+        _add_heading(doc, "数据流", 2)
+        _add_bullets(doc, content.get("data_flow", []), 5)
+
+    elif page_no == 4:
+        _add_heading(doc, "核心功能", 2)
+        _add_bullets(doc, content.get("core_functions", []), 6)
+        _add_heading(doc, "功能模块闭环", 2)
+        _add_bullets(doc, content.get("function_modules", []), 5)
+        _add_heading(doc, "硬件设计原则", 2)
+        _add_bullets(doc, content.get("hardware_design_principles", []), 4)
+        _add_heading(doc, "软件设计原则", 2)
+        _add_bullets(doc, content.get("software_design_principles", []), 4)
+
+    elif page_no == 5:
+        _add_heading(doc, "关键技术", 2)
+        _add_bullets(doc, content.get("key_technologies", []), 6)
+        _add_heading(doc, "技术实现路线", 2)
+        _add_bullets(doc, content.get("technical_route", []), 5)
+        _add_heading(doc, "工程指标", 2)
+        _add_bullets(doc, content.get("engineering_metrics", []), 4)
+        _add_heading(doc, "风险控制", 2)
+        _add_bullets(doc, content.get("risk_control", []), 4)
+
+    elif page_no == 6:
+        _add_heading(doc, "核心创新点", 2)
+        _add_bullets(doc, content.get("innovation_points", []), 5)
+        diff = content.get("differentiation_analysis", {})
+        _add_heading(doc, "差异化分析", 2)
+        similar = diff.get("similar_case", {}) or {}
+        _add_key_value(doc, "当前参考案例", similar.get("title", "样例案例"))
+        _add_key_value(doc, "最高相似度", diff.get("highest_similarity", 0))
+        _add_key_value(doc, "同质化惩罚", diff.get("homogeneity_penalty", 0))
+        _add_key_value(doc, "差异化加分", diff.get("differentiation_bonus", 0))
+        _add_key_value(doc, "当前限制", diff.get("current_gap"))
+        _add_key_value(doc, "升级方向", diff.get("next_upgrade"))
+
+    elif page_no == 7:
+        _add_heading(doc, "应用场景", 2)
+        _add_bullets(doc, content.get("application_scenarios", []), 5)
+        _add_heading(doc, "部署路径", 2)
+        _add_bullets(doc, content.get("deployment_paths", []), 5)
+        _add_heading(doc, "社会价值", 2)
+        _add_bullets(doc, content.get("social_value", []), 4)
+        _add_heading(doc, "商业化路径", 2)
+        _add_bullets(doc, content.get("commercialization_path", []), 4)
+        _add_heading(doc, "未来迭代", 2)
+        _add_bullets(doc, content.get("future_iterations", []), 4)
+        _add_key_value(doc, "数据边界", content.get("evidence_boundary"), 8.8)
+
+    image = page.get("image", {}) or {}
+    if image.get("required"):
+        _add_heading(doc, "配图建议", 3)
+        _add_key_value(doc, "图示类型", image.get("image_type"), 8.8)
+        _add_key_value(doc, "用途", image.get("purpose"), 8.8)
+
+
+def export_report_to_word(report_json: Dict[str, Any], session_key: str) -> Dict[str, str]:
+    doc = _prepare_document()
+
+    for page_no in range(1, 8):
+        _new_page_section(doc, page_no)
+        _render_report_page(doc, report_json, page_no)
+
+    digest = hashlib.sha1(
+        f"{session_key}-{report_json.get('project_title', '')}-{now_iso()}".encode("utf-8")
+    ).hexdigest()[:12]
+    filename = f"robot_competition_report_{digest}.docx"
+    file_path = EXPORT_DIR / filename
+    doc.save(file_path)
+
+    return {
+        "filename": filename,
+        "file_path": str(file_path),
+        "download_url": f"{PUBLIC_BASE_URL}/api/v1/robot-competition/download/{filename}"
+    }
 
 
 def detect_page_number(message: str) -> Optional[int]:
@@ -1047,9 +1305,9 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             },
             files=[],
             suggested_actions=[
+                "生成Word",
                 "查看报告结构数据",
-                "修改指定页面",
-                "下一步接入真实获奖案例"
+                "修改指定页面"
             ],
             updated_at=now_iso()
         )
@@ -1137,7 +1395,7 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             intent="modify_page_request",
             message=(
                 f"已记录第{page_no}页的修改要求。\n"
-                "当前 v0.4.0 先保证修改指令不丢失；下一阶段接入大模型定向改写后，会只改指定页面，不重生成整份报告。"
+                "当前 v0.4.1 先保证修改指令不丢失；下一阶段接入大模型定向改写后，会只改指定页面，不重生成整份报告。"
             ),
             payload_json=json.dumps(report_json, ensure_ascii=False, indent=2),
             download_url="",
@@ -1159,7 +1417,7 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
                 success=False,
                 stage="word_export_failed",
                 intent="word_export_pending",
-                message="当前还没有报告数据。请先完成选题并输入“生成报告”。",
+                message="当前还没有报告数据。请先完成选题并输入‘生成报告’。",
                 payload_json="",
                 download_url="",
                 data={},
@@ -1168,22 +1426,48 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
                 updated_at=now_iso()
             )
 
+        try:
+            export_info = export_report_to_word(report_json, session_key)
+        except Exception as exc:
+            return ChatResponse(
+                success=False,
+                stage="word_export_failed",
+                intent="word_export_pending",
+                message=f"Word生成失败：{type(exc).__name__}。请检查服务器依赖和日志。",
+                payload_json=json.dumps(report_json, ensure_ascii=False, indent=2),
+                download_url="",
+                data={"error": str(exc)},
+                files=[],
+                suggested_actions=["重新生成Word", "查看报告结构数据"],
+                updated_at=now_iso()
+            )
+
+        session["word_file"] = export_info
+        session["stage"] = "word_ready"
+
         return ChatResponse(
             success=True,
-            stage="word_export_pending",
+            stage="word_ready",
             intent="word_export_pending",
             message=(
-                "7页结构化报告数据已经准备好，但当前 v0.4.0 尚未伪装成已生成 Word 文件。\n"
-                "下一阶段我们会新增真正的 Word 导出接口，读取当前 report_json 并生成可下载 .docx。"
+                "Word报告已经生成完成。\n\n"
+                "文件为7页竞赛报告模板，已按封面、设计背景、整体结构、软硬件功能、"
+                "关键技术、创新点、行业应用前景依次分页。\n\n"
+                "请点击返回结果中的下载链接获取 .docx 文件。"
             ),
             payload_json=json.dumps(report_json, ensure_ascii=False, indent=2),
-            download_url="",
+            download_url=export_info["download_url"],
             data={
-                "current_stage": "word_export_pending",
-                "report_revision": session.get("report_revision", 1)
+                "current_stage": "word_ready",
+                "report_revision": session.get("report_revision", 1),
+                "filename": export_info["filename"]
             },
-            files=[],
-            suggested_actions=["下一步开发Word导出", "查看报告结构数据"],
+            files=[{
+                "name": export_info["filename"],
+                "type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "url": export_info["download_url"]
+            }],
+            suggested_actions=["下载Word", "修改指定页面", "查看报告结构数据"],
             updated_at=now_iso()
         )
 
@@ -1198,6 +1482,21 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
         files=[],
         suggested_actions=["输入创意", "重新生成", "输入1/2/3", "生成报告"],
         updated_at=now_iso()
+    )
+
+
+@app.get("/api/v1/robot-competition/download/{filename}")
+def download_report(filename: str):
+    safe_name = Path(filename).name
+    file_path = EXPORT_DIR / safe_name
+
+    if not file_path.exists() or file_path.suffix.lower() != ".docx":
+        return {"success": False, "message": "文件不存在或已失效，请重新生成Word。"}
+
+    return FileResponse(
+        path=str(file_path),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=safe_name
     )
 
 
