@@ -1122,27 +1122,27 @@ def detect_intent(message: str, session: Dict[str, Any]) -> str:
     ):
         return "select_title"
 
-    if contains_any(text, ["生成报告", "写报告"]):
+       if contains_any(text, ["生成报告", "写报告"]):
         return "generate_report"
 
     # Word 导出暂不伪装成“已完成”
-   if contains_any(
-    text,
-    [
-        "生成word",
-        "生成Word",
-        "导出word",
-        "导出Word",
-        "下载word",
-        "下载Word",
-        "生成文档",
-        "下载报告",
-        "导出报告",
-        "生成word报告",
-        "生成Word报告",
-    ],
-):
-    return "word_export_pending"
+    if contains_any(
+        text,
+        [
+            "生成word",
+            "生成Word",
+            "导出word",
+            "导出Word",
+            "下载word",
+            "下载Word",
+            "生成文档",
+            "下载报告",
+            "导出报告",
+            "生成word报告",
+            "生成Word报告",
+        ],
+    ):
+        return "word_export_pending"
 
     if "raw_idea" not in session:
         return "create_project"
