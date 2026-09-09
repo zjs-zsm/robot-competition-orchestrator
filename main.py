@@ -1104,7 +1104,10 @@ def detect_page_number(message: str) -> Optional[int]:
 def detect_intent(message: str, session: Dict[str, Any]) -> str:
     text = normalize_text(message)
 
-    if contains_any(text, ["查看报告结构", "查看结构化数据", "查看json", "查看JSON"]):
+    if contains_any(
+        text,
+        ["查看报告结构", "查看结构化数据", "查看json", "查看JSON"],
+    ):
         return "view_report_json"
 
     if (
@@ -1113,19 +1116,25 @@ def detect_intent(message: str, session: Dict[str, Any]) -> str:
     ):
         return "modify_page_request"
 
-    if contains_any(text, ["重新生成", "重生成", "再生成", "换一批", "不满意"]):
+    if contains_any(
+        text,
+        ["重新生成", "重生成", "再生成", "换一批", "不满意"],
+    ):
         return "regenerate_titles"
 
     if (
         re.fullmatch(r"[123]", text)
-        or contains_any(text, ["选1", "选2", "选3", "第一个", "第二个", "第三个"])
+        or contains_any(
+            text,
+            ["选1", "选2", "选3", "第一个", "第二个", "第三个"],
+        )
     ):
         return "select_title"
 
-       if contains_any(text, ["生成报告", "写报告"]):
+    if contains_any(text, ["生成报告", "写报告"]):
         return "generate_report"
 
-    # Word 导出暂不伪装成“已完成”
+    # Word 导出
     if contains_any(
         text,
         [
@@ -1148,7 +1157,6 @@ def detect_intent(message: str, session: Dict[str, Any]) -> str:
         return "create_project"
 
     return "supplement_idea"
-
 
 def parse_selection(message: str) -> Optional[int]:
     text = normalize_text(message)
