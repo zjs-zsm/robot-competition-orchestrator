@@ -156,12 +156,37 @@ def jaccard_similarity(first_words: List[str], second_words: List[str]) -> float
 
 def build_session_key(req: ChatRequest) -> str:
     """
-    关键修复：
-    不再使用固定 session_key。
-    同一用户 + 同一会话使用同一状态；不同会话互不污染。
+    构建稳定会话键。
+
+    学习通部分调用可能传入 current_user / current_session
+    等占位值。将这些占位值统一归一化，避免同一轮任务
+    在“下载报告”时突然切换到新的 session。
     """
-    user_id = (req.user_id or "anonymous").strip()
-    session_id = (req.session_id or "default").strip()
+    user_id = (req.user_id or "").strip()
+    session_id = (req.session_id or "").strip()
+
+    placeholder_users = {
+        "",
+        "anonymous",
+        "current_user",
+        "user_456",
+        "chaoxing-test-user",
+    }
+
+    placeholder_sessions = {
+        "",
+        "default",
+        "current_session",
+        "current_session_123",
+        "chaoxing-test-001",
+    }
+
+    if user_id in placeholder_users:
+        user_id = "anonymous"
+
+    if session_id in placeholder_sessions:
+        session_id = "default"
+
     return f"{user_id}:{session_id}"
 
 
