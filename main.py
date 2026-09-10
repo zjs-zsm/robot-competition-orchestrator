@@ -1179,6 +1179,8 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
     user_message = clean_message(req.message)
     intent = detect_intent(user_message, session)
 
+    print("DEBUG_MESSAGE:", user_message, "INTENT:", intent, flush=True)
+
     if intent in ["create_project", "supplement_idea", "regenerate_titles"]:
         if intent == "create_project":
             raw_idea = user_message
