@@ -1453,7 +1453,10 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
 
         try:
             export_info = export_report_to_word(report_json, session_key)
+            print("DEBUG_WORD_SUCCESS:", export_info, flush=True)
+
         except Exception as exc:
+            print("DEBUG_WORD_ERROR:", repr(exc), flush=True)
             return ChatResponse(
                 success=False,
                 stage="word_export_failed",
