@@ -1180,6 +1180,7 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
     intent = detect_intent(user_message, session)
 
     print("DEBUG_MESSAGE:", user_message, "INTENT:", intent, flush=True)
+    print("DEBUG_SESSION:", session_key, "SESSION_KEYS:", list(session.keys()), flush=True)
 
     if intent in ["create_project", "supplement_idea", "regenerate_titles"]:
         if intent == "create_project":
