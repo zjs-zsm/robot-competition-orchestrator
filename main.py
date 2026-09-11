@@ -1191,8 +1191,9 @@ def export_report_to_word(report_json: Dict[str, Any], session_key: str) -> Dict
     digest = hashlib.sha1(
         f"{session_key}-{report_json.get('project_title','')}-{now_iso()}".encode("utf-8")
     ).hexdigest()[:12]
-    project_slug = safe_filename(report_json.get("project_title", "robot_report"), 24)
-    filename = f"{project_slug}_{digest}.docx"
+
+    # 下载URL永远只使用ASCII文件名，避免学习通/浏览器截断中文链接
+    filename = f"robot_competition_report_{digest}.docx"
     path = EXPORT_DIR / filename
     doc.save(path)
 
