@@ -1040,20 +1040,171 @@ def _download_binary(url: str, dest: Path, headers: Optional[Dict[str, str]] = N
 
 
 def _pollinations_image(prompt: str, dest: Path) -> bool:
+    """
+    Pollinations 图片生成。
+    优先使用官方 OpenAI-compatible /v1/images/generations，
+    如果失败，再尝试 /image/{prompt} GET 接口。
+    """
     if not POLLINATIONS_API_KEY:
+        print("POLLINATIONS_ERROR: API key missing", flush=True)
         return False
-    encoded = urllib.parse.quote(prompt[:1800], safe="")
-    url = (
-        f"https://gen.pollinations.ai/image/{encoded}"
-        f"?model={urllib.parse.quote(POLLINATIONS_IMAGE_MODEL)}&width=1280&height=768&nologo=true"
-    )
-    return _download_binary(
-        url,
-        dest,
-        headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"},
-        timeout=IMAGE_TIMEOUT,
-    )
 
+    import base64
+    import urllib.error
+
+    # ---------- 方式1：官方 POST 图片生成接口 ----------
+    try:
+        url = "https://gen.pollinations.ai/v1/images/generations"
+
+        payload = {
+            "model": POLLINATIONS_IMAGE_MODEL or "flux",
+            "prompt": prompt,
+            "size": "1536x1024",
+            "n": 1,
+            "response_format": "b64_json",
+        }
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {POLLINATIONS_API_KEY}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+
+        with urllib.request.urlopen(req, timeout=IMAGE_TIMEOUT) as resp:
+            raw = resp.read()
+            status = resp.status
+
+        print(f"POLLINATIONS_POST_STATUS: {status}", flush=True)
+
+        data = json.loads(raw.decode("utf-8"))
+
+        items = data.get("data") or []
+        if items:
+            item = items[0]
+
+            if item.get("b64_json"):
+                image_bytes = base64.b64decode(item["b64_json"])
+                dest.write_bytes(image_bytes)
+
+                if dest.exists() and dest.stat().st_size > 5000:
+                    print(
+                        f"POLLINATIONS_IMAGE_SUCCESS: {dest} "
+                        f"{dest.stat().st_size} bytes",
+                        flush=True,
+                    )
+                    return True
+
+            if item.get("url"):
+                if _download_binary(
+                    item["url"],
+                    dest,
+                    timeout=IMAGE_TIMEOUT,
+                ):
+                    print(
+                        f"POLLINATIONS_IMAGE_SUCCESS_URL: {dest}",
+                        flush=True,
+                    )
+                    return True
+
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="ignore")
+        except Exception:
+            body = ""
+
+        print(
+            f"POLLINATIONS_POST_HTTP_ERROR: "
+            f"{exc.code} {exc.reason} {body[:1000]}",
+            flush=True,
+        )
+
+    except Exception as exc:
+        print(
+            "POLLINATIONS_POST_ERROR:",
+            repr(exc),
+            flush=True,
+        )
+
+    # ---------- 方式2：GET /image/{prompt} 兜底 ----------
+    try:
+        encoded = urllib.parse.quote(prompt[:1800], safe="")
+
+        query = urllib.parse.urlencode(
+            {
+                "model": POLLINATIONS_IMAGE_MODEL or "flux",
+                "width": 1280,
+                "height": 768,
+                "nologo": "true",
+                "key": POLLINATIONS_API_KEY,
+            }
+        )
+
+        url = (
+            f"https://gen.pollinations.ai/image/{encoded}"
+            f"?{query}"
+        )
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "RobotCompetitionAssistant/2.0",
+                "Accept": "image/*",
+            },
+        )
+
+        with urllib.request.urlopen(req, timeout=IMAGE_TIMEOUT) as resp:
+            image_bytes = resp.read()
+            content_type = (
+                resp.headers.get("Content-Type") or ""
+            ).lower()
+
+        print(
+            f"POLLINATIONS_GET_STATUS: "
+            f"{content_type}, {len(image_bytes)} bytes",
+            flush=True,
+        )
+
+        if (
+            len(image_bytes) > 5000
+            and (
+                "image/" in content_type
+                or image_bytes[:3] == b"\xff\xd8\xff"
+                or image_bytes[:8] == b"\x89PNG\r\n\x1a\n"
+            )
+        ):
+            dest.write_bytes(image_bytes)
+
+            print(
+                f"POLLINATIONS_GET_SUCCESS: {dest}",
+                flush=True,
+            )
+            return True
+
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="ignore")
+        except Exception:
+            body = ""
+
+        print(
+            f"POLLINATIONS_GET_HTTP_ERROR: "
+            f"{exc.code} {exc.reason} {body[:1000]}",
+            flush=True,
+        )
+
+    except Exception as exc:
+        print(
+            "POLLINATIONS_GET_ERROR:",
+            repr(exc),
+            flush=True,
+        )
+
+    return False
 
 def _commons_search_terms(report: Dict[str, Any], kind: str) -> str:
     hint = _domain_hint(report)
