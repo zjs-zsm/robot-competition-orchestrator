@@ -1189,17 +1189,18 @@ def export_report_to_word(report_json: Dict[str, Any], session_key: str) -> Dict
         _render_page(doc, report_json, page_no, images)
 
     digest = hashlib.sha1(
-        f"{session_key}-{report_json.get('project_title','')}-{now_iso()}".encode("utf-8")
+    f"{session_key}-{report_json.get('project_title','')}-{now_iso()}".encode("utf-8")
     ).hexdigest()[:12]
-    project_slug = safe_filename(report_json.get("project_title", "robot_report"), 24)
-    filename = f"{project_slug}_{digest}.docx"
+
+    filename = f"robot_competition_report_{digest}.docx"
+
     path = EXPORT_DIR / filename
     doc.save(path)
 
     return {
-        "filename": filename,
-        "file_path": str(path),
-        "download_url": f"{PUBLIC_BASE_URL}/api/v1/robot-competition/download/{filename}",
+    "filename": filename,
+    "file_path": str(path),
+    "download_url": f"{PUBLIC_BASE_URL}/api/v1/robot-competition/download/{filename}",
     }
 
 
