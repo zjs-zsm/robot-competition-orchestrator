@@ -22,19 +22,18 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.section import WD_SECTION
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.shared import Cm, Pt
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from PIL import Image, ImageDraw, ImageFont
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "5.1.0"
 
 app = FastAPI(
     title="Robot Competition Orchestrator",
     version=APP_VERSION,
-    description="智能机器人创意竞赛助手 V3.1 图文竞赛报告中央编排器",
+    description="智能机器人创意竞赛助手 V5.0 最终整合版中央编排器",
 )
 
 app.add_middleware(
@@ -78,15 +77,12 @@ PUBLIC_BASE_URL = os.getenv(
     "https://robot-competition-orchestrator.onrender.com",
 ).rstrip("/")
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/robot_competition_data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-EXPORT_DIR = Path(os.getenv("EXPORT_DIR", str(DATA_DIR / "exports")))
+EXPORT_DIR = Path(os.getenv("EXPORT_DIR", "/tmp/robot_competition_exports"))
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 SESSION_DB_PATH = os.getenv(
     "SESSION_DB_PATH",
-    str(DATA_DIR / "sessions.sqlite3"),
+    "/tmp/robot_competition_sessions.sqlite3",
 )
 
 # 可选：任意 OpenAI-compatible Chat Completions 服务。
@@ -100,15 +96,15 @@ LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "45"))
 KNOWLEDGE_API_URL = os.getenv("KNOWLEDGE_API_URL", "").strip()
 KNOWLEDGE_API_KEY = os.getenv("KNOWLEDGE_API_KEY", "").strip()
 
-# 可选图片生成/检索接口。留空时自动生成项目相关结构示意图。
+# 可选图片生成/检索接口。
 IMAGE_API_URL = os.getenv("IMAGE_API_URL", "").strip()
 IMAGE_API_KEY = os.getenv("IMAGE_API_KEY", "").strip()
 
-# 推荐图像生成服务。配置后可自动生成“产品效果图 + 应用场景图”。
-# 未配置时仍会生成本地概念插画与原生Word架构/流程可视化，不影响主流程。
+# AI图片：用于第1页产品展示图和第2页真实应用场景图。
 POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY", "").strip()
 POLLINATIONS_IMAGE_MODEL = os.getenv("POLLINATIONS_IMAGE_MODEL", "flux").strip() or "flux"
 IMAGE_TIMEOUT = int(os.getenv("IMAGE_TIMEOUT", "90"))
+STRICT_AI_IMAGES = os.getenv("STRICT_AI_IMAGES", "true").strip().lower() not in {"0", "false", "no", "off"}
 
 
 # ============================================================
@@ -697,25 +693,12 @@ def format_candidate_message(fields: Dict[str, Any], candidates: List[Dict[str, 
 # 7页动态报告
 # ============================================================
 def _local_report(fields: Dict[str, Any], selected: Dict[str, Any], knowledge: Dict[str, Any]) -> Dict[str, Any]:
-    """生成内容较完整的7页报告底稿。
-
-    这一层必须在没有外部LLM时也能独立工作；若配置LLM，build_report_json会再做一次增强。
-    """
     title = selected["title"]
-    target_list = fields.get("target_groups", []) or ["目标用户"]
-    scene_list = fields.get("scenarios", []) or ["实际应用场景"]
-    funcs = fields.get("core_functions", []) or ["智能感知", "任务决策", "自主服务"]
-    techs = fields.get("tech_modules", []) or ["传感器采集", "智能决策", "执行控制"]
-    pain = fields.get("pain_points", []) or ["现有方案连续服务能力不足"]
-    target = "、".join(target_list)
-    scenes = "、".join(scene_list)
-    func_text = "、".join(funcs[:6])
-    tech_text = "、".join(techs[:6])
-    raw_idea = fields.get("raw_idea", "")
-
-    score = selected.get("scores", {}).get("competitiveness_score")
-    positioning = selected.get("positioning", "")
-    differentiator = selected.get("differentiator", "")
+    target = "、".join(fields.get("target_groups", []))
+    scenes = "、".join(fields.get("scenarios", []))
+    funcs = fields.get("core_functions", [])
+    techs = fields.get("tech_modules", [])
+    pain = fields.get("pain_points", [])
 
     pages = {
         "page_1": {
@@ -723,14 +706,10 @@ def _local_report(fields: Dict[str, Any], selected: Dict[str, Any], knowledge: D
             "module": "封面",
             "title": title,
             "content": {
-                "subtitle": "智能机器人创意竞赛 · 项目设计报告",
-                "project_positioning": positioning,
-                "design_statement": (
-                    f"本项目面向{target}，聚焦{scenes}，以{func_text}为主要功能，"
-                    f"通过{tech_text}构建从感知、判断到执行和反馈的完整机器人服务闭环。"
-                ),
+                "subtitle": "智能机器人创意竞赛项目设计报告",
+                "project_positioning": selected.get("positioning", ""),
                 "keywords": fields.get("keywords", [])[:8],
-                "competition_score": score,
+                "competition_score": selected.get("scores", {}).get("competitiveness_score"),
             },
         },
         "page_2": {
@@ -738,25 +717,15 @@ def _local_report(fields: Dict[str, Any], selected: Dict[str, Any], knowledge: D
             "module": "设计背景",
             "title": "设计背景与用户需求",
             "content": {
-                "background_paragraphs": [
-                    f"随着家庭服务、智能感知与物联网技术的发展，{scenes}正在从单点智能设备逐步向能够主动感知、持续服务和协同执行的机器人系统演进。"
-                    f"对于{target}而言，真正有价值的产品并不是简单增加一个提醒或遥控功能，而是能够在无人持续操作的情况下完成连续任务，并在异常时及时反馈。",
-                    f"本项目来源于用户原始创意：{raw_idea}。围绕这一创意，方案将需求拆分为“感知对象—状态判断—任务决策—执行动作—结果反馈”五个环节，避免只做功能堆叠，强调完整服务闭环与竞赛展示效果。",
-                    f"现有同类产品常见问题包括：功能相互割裂、对真实场景适应性不足、异常处理依赖人工以及长期运行稳定性不高。因此本项目将{func_text}进行协同设计，并把可量化测试指标纳入方案。",
+                "background": [
+                    f"项目面向{target}，聚焦{scenes}中的真实使用需求。",
+                    f"用户原始创意：{fields.get('raw_idea', '')}",
                 ],
                 "pain_points": pain,
-                "user_needs": [
-                    f"低门槛：面向{target}，交互方式应直观，减少复杂设置。",
-                    f"持续性：在{scenes}中支持长期、重复任务自动执行。",
-                    "主动性：不仅等待用户指令，还能够识别关键事件并主动触发服务。",
-                    "可靠性：关键操作应有状态确认、失败重试和人工兜底。",
-                    "可扩展性：预留传感器、执行机构、联网设备和知识库接口。",
-                ],
                 "design_goals": [
                     fields.get("design_goal", ""),
-                    "构建可感知、可判断、可执行、可反馈的机器人服务闭环。",
-                    "兼顾竞赛展示性、工程可实现性、用户体验和后续扩展空间。",
-                    "通过明确的功能指标和场景测试，让创新点可以被验证而不是停留在概念描述。",
+                    "从单一功能演示升级为可持续运行的机器人服务闭环。",
+                    "兼顾竞赛展示性、工程可实现性和后续扩展空间。",
                 ],
             },
         },
@@ -765,34 +734,14 @@ def _local_report(fields: Dict[str, Any], selected: Dict[str, Any], knowledge: D
             "module": "产品整体结构",
             "title": "机器人整体结构设计",
             "content": {
-                "overview": (
-                    f"机器人总体采用模块化分层架构。系统围绕{scenes}中的任务需求，把硬件感知、边缘计算、任务决策、执行机构、"
-                    f"人机交互与远程服务统一到同一控制链路中。核心模块包括{func_text}。"
-                ),
                 "system_layers": [
-                    "感知层：通过摄像头、环境传感器、状态传感器或用户输入采集场景信息，并完成数据时间同步与基础过滤。",
-                    "认知决策层：对感知结果进行融合，完成目标/状态识别、异常判断、任务优先级排序和执行策略生成。",
-                    "执行层：根据任务类型驱动移动底盘、机械执行机构、语音提示、喂食/清洁/开关等功能模块完成动作。",
-                    "交互与联网层：面向用户提供提示、确认、任务进度、异常消息和远程信息同步，并记录关键运行日志。",
+                    "感知层：采集视觉、环境、状态与用户输入",
+                    "认知层：完成识别、融合、风险判断和任务规划",
+                    "执行层：通过移动底盘、机械执行机构、语音或联网设备完成动作",
+                    "交互层：向用户提供提示、确认、反馈与远程信息同步",
                 ],
                 "core_modules": funcs,
-                "mechanical_concept": (
-                    f"本体结构围绕{scenes}进行模块化设计。主体可采用移动底盘或固定式底座，根据实际任务配置摄像头、传感器阵列、"
-                    "主控计算单元、执行机构与交互终端。模块之间采用标准化供电与通信接口，便于竞赛阶段快速替换和迭代。"
-                ),
-                "system_block_diagram": {
-                    "inputs": ["用户指令", "场景/对象状态", "传感器数据"],
-                    "perception": techs[:2] or ["多源感知", "数据预处理"],
-                    "decision": ["状态识别", "任务规划", "安全判断"],
-                    "execution": funcs[:4] or ["执行机构", "服务动作"],
-                    "feedback": ["执行确认", "异常提醒", "远程同步"],
-                },
-                "design_principles": [
-                    "重心与运动机构优先保证稳定性和安全性。",
-                    "传感器布置兼顾视野、遮挡、维护和线缆走向。",
-                    "高频使用模块采用快拆或抽拉结构，方便清洁与维护。",
-                    "外观与结构突出项目主题，使评委能够快速理解功能分区。",
-                ],
+                "mechanical_concept": f"围绕{scenes}构建模块化机器人本体，可按实际任务配置移动底盘、传感组件、交互终端和执行机构。",
             },
         },
         "page_4": {
@@ -800,28 +749,9 @@ def _local_report(fields: Dict[str, Any], selected: Dict[str, Any], knowledge: D
             "module": "软硬件功能设计",
             "title": "硬件与软件功能设计",
             "content": {
-                "hardware": [
-                    {"name": "感知单元", "description": f"围绕{func_text}配置视觉、距离、环境或状态传感器；采样频率与安装位置按场景需求确定。"},
-                    {"name": "主控计算单元", "description": "负责数据预处理、状态融合、任务调度与本地决策；关键基础功能在网络异常时仍可工作。"},
-                    {"name": "执行机构", "description": "根据任务配置移动底盘、机械臂、舵机、电机、泵阀、喂食/清洁等专用机构，并增加限位和过流保护。"},
-                    {"name": "通信与供电", "description": "通过Wi-Fi/Bluetooth/蜂窝网络或局域网与移动端、云端或智能家居设备交互，并配置电量检测与低电量策略。"},
-                ],
-                "software": [
-                    {"name": "感知服务", "description": f"完成{tech_text}相关数据采集、预处理与质量检测。"},
-                    {"name": "状态识别", "description": "将单一传感器结果转化为可用于决策的状态标签，并对不确定结果保留置信度。"},
-                    {"name": "任务调度", "description": f"根据{func_text}设置优先级、触发条件、互斥条件和失败重试策略。"},
-                    {"name": "用户交互", "description": "提供状态提示、任务确认、异常提醒、远程查看与历史记录，减少用户操作负担。"},
-                ],
-                "hardware_software_block": {
-                    "input_side": ["视觉/环境/状态传感", "用户/移动端输入"],
-                    "control_side": ["主控计算", "状态识别", "任务调度", "安全策略"],
-                    "output_side": funcs[:4] or ["执行机构", "反馈终端"],
-                },
-                "interaction_logic": "用户/环境事件 → 多源感知 → 数据预处理 → 状态识别 → 风险与任务判断 → 执行动作 → 结果确认 → 记录与远程反馈",
-                "functional_matrix": [
-                    {"function": f, "trigger": "定时/事件/用户指令", "feedback": "状态提示 + 执行结果 + 异常记录"}
-                    for f in funcs[:6]
-                ],
+                "hardware": [f"传感与采集：{t}" for t in techs[:3]] + ["主控与通信：负责数据融合、任务调度和远程连接"],
+                "software": [f"功能模块：{f}" for f in funcs],
+                "interaction_logic": "用户输入/环境事件 → 传感采集 → 智能判断 → 执行动作 → 反馈确认 → 数据记录",
             },
         },
         "page_5": {
@@ -829,43 +759,13 @@ def _local_report(fields: Dict[str, Any], selected: Dict[str, Any], knowledge: D
             "module": "关键技术",
             "title": "关键技术与实现路线",
             "content": {
-                "technical_summary": (
-                    f"项目技术路线以{tech_text}为核心。实现时不追求复杂算法堆叠，而是把每项技术与具体任务、输入数据、判断逻辑、"
-                    "执行动作和测试指标对应起来，保证方案能够从概念顺利过渡到样机。"
-                ),
                 "key_technologies": [
-                    {
-                        "name": t,
-                        "implementation": (
-                            f"围绕“{t}”设计输入数据、预处理方式、阈值/模型判断、输出动作和失败兜底。"
-                            "竞赛阶段优先采用可复现、可解释、可快速迭代的实现方案，并记录关键日志用于调参。"
-                        ),
-                    }
-                    for t in techs[:6]
+                    {"name": t, "implementation": f"围绕{t}设计输入、算法处理、阈值/模型判定和输出动作，并设置可量化测试指标。"}
+                    for t in techs
                 ],
-                "technical_route": ["数据采集", "质量检查与预处理", "状态/目标识别", "多源信息融合", "任务决策", "执行控制", "反馈确认与日志记录"],
-                "project_workflow": [
-                    "场景触发/用户指令",
-                    "多源感知采集",
-                    "数据预处理",
-                    "状态/目标识别",
-                    "任务决策与安全判断",
-                    "执行机构动作",
-                    "结果确认与远程反馈",
-                ],
-                "engineering_metrics": [
-                    "识别类：准确率、召回率、误报率与复杂光照/遮挡条件下稳定性。",
-                    "实时类：感知到动作的端到端响应延迟。",
-                    "执行类：任务执行成功率、重复定位误差、机构卡滞/失败率。",
-                    "通信类：异常消息送达率、断网后的本地降级能力。",
-                    "可靠性：连续运行时长、异常恢复能力和关键模块故障隔离。",
-                ],
-                "risk_control": [
-                    "涉及安全的动作设置人工确认、软硬件限位和紧急停止。",
-                    "网络异常时保留本地基础任务，恢复连接后再同步日志。",
-                    "模型输出不确定时进入保守策略，避免直接执行高风险动作。",
-                    "涉及图像、语音与用户信息时设置最小化采集、权限管理和本地化存储策略。",
-                ],
+                "technical_route": ["数据采集", "预处理", "特征/状态识别", "多源信息融合", "任务决策", "执行控制", "反馈与记录"],
+                "engineering_metrics": ["识别准确率/误报率", "系统响应延迟", "任务执行成功率", "异常告警送达率", "连续运行稳定性"],
+                "risk_control": ["关键安全事件设置人工确认与兜底", "网络异常时保留本地基础能力", "避免把概念功能写成已完成实测", "保护图像、语音和用户数据"],
             },
         },
         "page_6": {
@@ -873,29 +773,16 @@ def _local_report(fields: Dict[str, Any], selected: Dict[str, Any], knowledge: D
             "module": "项目创新点",
             "title": "项目创新点与差异化分析",
             "content": {
-                "innovation_intro": (
-                    f"本项目的创新重点不是单独增加一个新功能，而是针对{target}在{scenes}中的连续需求，"
-                    f"把{func_text}组成可协同、可验证、可扩展的机器人服务系统。"
-                ),
                 "innovation_points": [
-                    {"name": "需求驱动", "description": f"从{target}在{scenes}中的真实痛点出发，功能设计与场景任务一一对应。"},
-                    {"name": "闭环服务", "description": "把感知、判断、执行、确认和记录连接起来，避免停留在提醒或遥控层面。"},
-                    {"name": "多模块协同", "description": f"让{'、'.join(funcs[:4])}按任务优先级协同工作，而不是相互独立展示。"},
-                    {"name": "工程化设计", "description": "采用模块化软硬件架构、失败重试、状态确认与安全兜底，提高样机可实现性。"},
-                    {"name": "持续演进", "description": "预留知识库、智能家居/移动端接口和新传感器接入能力，便于后续迭代。"},
-                ],
-                "comparison": [
-                    {"dimension": "需求理解", "common": "以功能清单为主", "ours": "从场景任务和用户痛点反推功能"},
-                    {"dimension": "交互方式", "common": "用户主动下达指令", "ours": "主动感知 + 事件触发 + 用户确认"},
-                    {"dimension": "系统结构", "common": "模块相互独立", "ours": "统一任务调度与状态闭环"},
-                    {"dimension": "可靠性", "common": "重演示、轻异常处理", "ours": "加入失败重试、日志和安全兜底"},
-                    {"dimension": "扩展能力", "common": "功能固定", "ours": "模块接口化并预留知识库与外部设备接口"},
+                    {"name": "需求驱动", "description": f"从{target}在{scenes}中的具体痛点出发，而不是简单堆叠功能。"},
+                    {"name": "机器人服务闭环", "description": "把感知、判断、执行、反馈串成完整闭环。"},
+                    {"name": "多模块协同", "description": f"将{'、'.join(funcs[:4])}进行任务级协同。"},
+                    {"name": "可扩展工程设计", "description": "采用模块化结构，便于后续增加传感器、执行机构和知识库。"},
                 ],
                 "differentiation_analysis": {
                     "knowledge_base_used": knowledge.get("knowledge_base_used", False),
                     "similar_award_cases": knowledge.get("similar_award_cases", [])[:3],
-                    "current_boundary": "未接入老师提供的真实获奖资料时，不把样例相似度宣传为真实获奖证据。",
-                    "selected_differentiator": differentiator,
+                    "current_boundary": "未接入真实获奖资料时，不把样例相似度宣传为真实获奖证据。",
                 },
             },
         },
@@ -904,42 +791,19 @@ def _local_report(fields: Dict[str, Any], selected: Dict[str, Any], knowledge: D
             "module": "行业应用前景",
             "title": "行业应用前景与落地路径",
             "content": {
-                "prospect_paragraphs": [
-                    f"从应用价值看，项目面向{target}，可首先在{scenes}完成小规模验证。与单一智能设备相比，机器人具备移动/执行、持续感知和多任务协同能力，"
-                    "因此更适合承担具有连续性、重复性和异常处置要求的服务任务。",
-                    "从产品化路径看，应优先完成核心任务闭环，再逐步增加高级功能。竞赛样机阶段重点证明功能可行和场景价值；后续可通过模块化版本、移动端服务、"
-                    "智能家居或行业平台接入形成更完整的产品体系。",
-                ],
-                "application_scenarios": scene_list,
-                "target_users": target_list,
-                "landing_roadmap_title": "从竞赛样机到场景落地",
-                "deployment_paths": [
-                    "阶段1：完成核心功能最小可行样机，验证主任务闭环。",
-                    "阶段2：在目标场景开展连续测试，记录成功、失败和异常样本。",
-                    "阶段3：根据测试结果优化结构、算法、交互和安全策略。",
-                    "阶段4：形成模块化版本，适配不同家庭/场景和成本档位。",
-                    "阶段5：接入移动端、智能家居、知识库或行业平台，构建持续服务能力。",
-                ],
-                "social_value": [
-                    "降低重复性人工工作负担，提高用户时间利用效率。",
-                    "提高异常发现和信息反馈速度，减少关键事件漏报。",
-                    "通过持续服务与低门槛交互提升目标用户使用体验。",
-                    "形成可扩展的数据与服务闭环，为后续算法迭代提供基础。",
-                ],
-                "future_iterations": [
-                    "接入老师提供的真实往届获奖作品知识库，完善相似度与竞争力分析。",
-                    "增加真实场景测试数据和可量化指标，形成更有说服力的竞赛证据。",
-                    "优化机器人外观、结构与交互细节，提升作品完成度和展示效果。",
-                    "补齐答辩PPT、演示视频、结构图纸和测试记录，形成完整参赛材料。",
-                ],
+                "application_scenarios": fields.get("scenarios", []),
+                "target_users": fields.get("target_groups", []),
+                "deployment_paths": ["完成核心功能样机", "开展目标场景测试", "记录失败案例并迭代", "形成模块化版本", "与行业平台/智能设备接口联动"],
+                "social_value": ["降低重复性人工工作负担", "提高异常发现与处置效率", "提升目标用户安全性和便利性", "形成可持续迭代的数据与服务闭环"],
+                "future_iterations": ["接入真实往届获奖作品知识库", "增加真实场景测试数据", "优化机器人外观与结构设计", "完善竞赛答辩材料和演示视频"],
             },
         },
     }
 
     return {
-        "schema_version": "2.0",
+        "schema_version": "1.0",
         "project_title": title,
-        "raw_idea": raw_idea,
+        "raw_idea": fields.get("raw_idea", ""),
         "selected_candidate": selected,
         "idea_fields": fields,
         "knowledge": {
@@ -952,6 +816,7 @@ def _local_report(fields: Dict[str, Any], selected: Dict[str, Any], knowledge: D
         "pages": pages,
         "generated_at": now_iso(),
     }
+
 
 def build_report_json(fields: Dict[str, Any], selected: Dict[str, Any], knowledge: Dict[str, Any]) -> Dict[str, Any]:
     base = _local_report(fields, selected, knowledge)
@@ -998,91 +863,168 @@ def format_report_summary(report_json: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _find_cjk_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for fp in candidates:
+        if Path(fp).exists():
+            try:
+                return ImageFont.truetype(fp, size=size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> List[str]:
+    text = str(text or "")
+    if not text:
+        return []
+    lines, current = [], ""
+    for ch in text:
+        test = current + ch
+        bbox = draw.textbbox((0, 0), test, font=font)
+        if bbox[2] - bbox[0] <= max_width or not current:
+            current = test
+        else:
+            lines.append(current)
+            current = ch
+    if current:
+        lines.append(current)
+    return lines
+
+
 # ============================================================
-# 动态图片：项目相关概念图、结构图、流程图、创新图
+# 可视化系统
+# 第1页：AI产品展示图
+# 第2页：AI真实应用场景图
+# 第3-7页：根据项目数据自动绘制专业框图/流程图
 # ============================================================
-def _domain_hint(report: Dict[str, Any]) -> str:
+def _domain_profile(report: Dict[str, Any]) -> Dict[str, str]:
     fields = report.get("idea_fields", {})
     raw = fields.get("raw_idea", "")
     text = normalize_text(raw + " " + " ".join(fields.get("core_functions", [])))
+
     if contains_any(text, ["宠物", "猫", "狗", "猫砂", "喂食"]):
-        return "pet care robot in a modern home, cat or dog nearby"
-    if contains_any(text, ["老人", "养老", "跌倒", "用药"]):
-        return "home elder-care companion robot assisting an older adult"
-    if contains_any(text, ["厨房", "燃气", "关火", "烹饪"]):
-        return "home kitchen safety robot near a stove and cooking area"
-    if contains_any(text, ["植物", "浇水", "多肉", "园艺"]):
-        return "home plant-care robot tending potted plants on a balcony"
-    if contains_any(text, ["儿童", "学习", "教育", "作业"]):
-        return "family educational companion robot helping a child study"
+        return {
+            "domain": "home pet-care robot",
+            "hero_context": "premium smart pet-care service robot prototype",
+            "scene_context": "a real lived-in modern home pet area with a cat or dog",
+            "task_examples": "automatic feeding, litter cleaning, pet status recognition, safe interaction, remote anomaly notification",
+        }
+    if contains_any(text, ["老人", "养老", "跌倒", "用药", "陪护"]):
+        return {
+            "domain": "home elder-care robot",
+            "hero_context": "safe human-centered elder-care service robot prototype",
+            "scene_context": "a real apartment with an older adult",
+            "task_examples": "medication reminder, fall detection, voice companionship, emergency notification",
+        }
+    if contains_any(text, ["厨房", "燃气", "关火", "烹饪", "烟雾"]):
+        return {
+            "domain": "home kitchen safety robot",
+            "hero_context": "compact kitchen safety inspection robot prototype",
+            "scene_context": "a real residential kitchen with stove and cooking area",
+            "task_examples": "gas and smoke inspection, stove safety monitoring, risk alarm, valve or appliance linkage",
+        }
+    if contains_any(text, ["植物", "浇水", "园艺", "花卉", "多肉"]):
+        return {
+            "domain": "home plant-care robot",
+            "hero_context": "compact autonomous plant-care robot prototype",
+            "scene_context": "a balcony or indoor garden with real potted plants",
+            "task_examples": "soil and light sensing, watering, plant status recognition, automatic care scheduling",
+        }
+    if contains_any(text, ["学习", "儿童", "教育", "作业"]):
+        return {
+            "domain": "educational companion robot",
+            "hero_context": "friendly educational companion robot prototype",
+            "scene_context": "a real study room with a student",
+            "task_examples": "study reminders, interaction, learning assistance, progress feedback",
+        }
     if contains_any(text, ["清洁", "扫地", "拖地", "收纳"]):
-        return "home service robot doing cleaning and organizing"
-    if contains_any(text, ["农业", "果园", "温室", "采摘"]):
-        return "agricultural service robot working in a greenhouse or orchard"
+        return {
+            "domain": "home cleaning service robot",
+            "hero_context": "buildable autonomous home cleaning robot prototype",
+            "scene_context": "a real home living room or hallway",
+            "task_examples": "cleaning, obstacle avoidance, task planning, user notification",
+        }
     if contains_any(text, ["仓库", "物流", "搬运"]):
-        return "autonomous warehouse service robot moving goods"
-    return "smart service robot operating in its intended real-world environment"
+        return {
+            "domain": "warehouse mobile robot",
+            "hero_context": "industrial autonomous mobile robot prototype",
+            "scene_context": "a real warehouse aisle with shelves and packages",
+            "task_examples": "autonomous transport, obstacle avoidance, route planning, scheduling",
+        }
+    return {
+        "domain": "smart service robot",
+        "hero_context": "buildable intelligent service robot engineering prototype",
+        "scene_context": "its intended real-world service environment",
+        "task_examples": ", ".join(fields.get("core_functions", [])[:5]) or "sensing, decision making, task execution and feedback",
+    }
 
 
-def _visual_prompt(report: Dict[str, Any], kind: str, variant: int = 0) -> str:
-    """为封面产品图和第2页场景图生成强区分提示词。
-
-    page_1/page_2 支持 visual_override，用户可通过“修改第1页图片……”或
-    “修改第2页场景图……”继续定制；重新导出 Word 时自动重新生成。
-    """
+def _hero_prompt(report: Dict[str, Any]) -> str:
     fields = report.get("idea_fields", {})
-    title = report.get("project_title", "smart service robot")
+    profile = _domain_profile(report)
     funcs = ", ".join(fields.get("core_functions", [])[:5])
     techs = ", ".join(fields.get("tech_modules", [])[:4])
-    domain = _domain_hint(report)
+    notes = " ".join(report.get("pages", {}).get("page_1", {}).get("revision_notes", []))
+    return (
+        f"Industrial design hero shot of ONE {profile['hero_context']} for a university robotics competition. "
+        f"Core functions: {funcs}. Technologies: {techs}. "
+        "STRICT COMPOSITION: single robot only; absolutely no people, no pets, no food bowls, no litter box, no phone screen, no task demonstration, no infographic. "
+        "Three-quarter front view, robot fills about 70 percent of frame, isolated on a clean neutral studio background or simple product pedestal, "
+        "professional industrial-design product photography, physically plausible wheels/sensors/actuators, realistic materials, elegant engineering prototype, "
+        "high detail, sharp focus, restrained lighting, 16:9 landscape. No text, no logo, no watermark. "
+        f"Optional revision requirements: {notes}"
+    )
 
-    p1 = report.get("pages", {}).get("page_1", {}).get("content", {})
-    p2 = report.get("pages", {}).get("page_2", {}).get("content", {})
-    override = ""
-    if kind == "product":
-        override = str(p1.get("visual_override", "")).strip()
-    elif kind == "scene":
-        override = str(p2.get("visual_override", "")).strip()
 
-    if kind == "product":
-        prompt = (
-            f"Professional university robotics competition PRODUCT HERO IMAGE for project: {title}. "
-            f"Design a realistic, buildable engineering prototype for {domain}. Core functions: {funcs}. "
-            f"Technical cues: {techs}. SINGLE ROBOT ONLY as the dominant subject, three-quarter front product view, "
-            "full robot body visible, clean industrial-design presentation, premium prototype materials, engineering joints, "
-            "sensors and actuators visible, neutral exhibition or studio background, minimal props, NO cat/dog/person interacting, "
-            "NO narrative action, NO split screen, NO text, NO logo, photorealistic product photography, 16:9. "
-        )
-    elif kind == "scene":
-        prompt = (
-            f"REAL-WORLD APPLICATION SCENE for robotics competition project: {title}. "
-            f"Show the robot actively performing one concrete task in {domain}. Functions: {funcs}. "
-            "Wide environmental composition, strong context, target user/object clearly participating, robot captured mid-task, "
-            "show practical workflow and interaction rather than a product pose. Camera angle and composition MUST be completely different "
-            "from a studio product hero shot. Include relevant home/work environment and task objects. NO text, NO logo, realistic documentary "
-            "photography, believable engineering prototype, 16:9. "
-        )
-    else:
-        prompt = (
-            f"Functional engineering detail of robot project {title}; sensors and actuators for {funcs}; "
-            f"technologies {techs}; realistic prototype, no text, no logo, 16:9. "
-        )
+def _scene_prompt(report: Dict[str, Any], attempt: int = 0) -> str:
+    fields = report.get("idea_fields", {})
+    profile = _domain_profile(report)
+    funcs = ", ".join(fields.get("core_functions", [])[:5])
+    notes = " ".join(report.get("pages", {}).get("page_2", {}).get("revision_notes", []))
+    variants = [
+        "wide-angle documentary photograph from room corner, environment clearly visible",
+        "eye-level candid documentary photograph, robot smaller in frame and task interaction dominant",
+        "side-view lifestyle photograph, show before-action-after context and environmental details",
+    ]
+    variant = variants[attempt % len(variants)]
+    return (
+        f"REAL APPLICATION SCENE for a university robotics competition project using a {profile['domain']}. "
+        f"Environment: {profile['scene_context']}. The robot is visibly performing a concrete useful task such as {profile['task_examples']}. "
+        f"Functions represented naturally: {funcs}. "
+        f"STRICT COMPOSITION: {variant}; this must NOT look like a studio product hero shot and must NOT reuse a clean-background product composition; "
+        "include the relevant user/object/environment interaction and at least one obvious task object from the scenario; robot occupies no more than 30 percent of the frame; "
+        "show a wide environmental composition, believable task action, practical safety, natural lighting, documentary/lifestyle photography, and visible context before/after the task. "
+        "No isolated product pedestal, no diagram, no infographic, no text, no logo, no watermark, 16:9 landscape. "
+        f"Optional revision requirements: {notes}"
+    )
 
-    if override:
-        prompt += f" User requested visual change: {override}. "
-    if variant:
-        prompt += (
-            f" Regeneration variant {variant}: use a substantially different camera position, background layout, robot pose, "
-            "object placement and visual composition from any previous image; preserve project identity but avoid near-duplicate imagery. "
-        )
-    return prompt
+
+def _is_valid_image_bytes(data: bytes, content_type: str = "") -> bool:
+    if len(data) < 5000:
+        return False
+    ctype = (content_type or "").lower()
+    return (
+        "image/" in ctype
+        or data[:3] == b"\xff\xd8\xff"
+        or data[:8] == b"\x89PNG\r\n\x1a\n"
+        or data[:4] == b"RIFF"
+    )
+
 
 def _download_binary(url: str, dest: Path, headers: Optional[Dict[str, str]] = None, timeout: int = 90) -> bool:
     try:
         req = urllib.request.Request(url, headers=headers or {}, method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = resp.read()
-        if len(data) < 5000:
+            ctype = resp.headers.get("Content-Type") or ""
+        if not _is_valid_image_bytes(data, ctype):
+            print("IMAGE_INVALID_RESPONSE:", ctype, len(data), flush=True)
             return False
         dest.write_bytes(data)
         return True
@@ -1092,154 +1034,103 @@ def _download_binary(url: str, dest: Path, headers: Optional[Dict[str, str]] = N
 
 
 def _pollinations_image(prompt: str, dest: Path) -> bool:
-    """Pollinations 图片生成。优先 POST OpenAI-compatible 接口，失败后 GET 兜底。"""
+    """双通道调用 Pollinations：先POST兼容接口，失败后GET图片接口。"""
     if not POLLINATIONS_API_KEY:
-        print("POLLINATIONS_ERROR: API key missing", flush=True)
+        print("POLLINATIONS_SKIPPED: API key missing", flush=True)
         return False
 
-    # 方式1：OpenAI-compatible 图片生成接口
+    # 方式1：OpenAI-compatible images endpoint
     try:
-        url = "https://gen.pollinations.ai/v1/images/generations"
         payload = {
-            "model": POLLINATIONS_IMAGE_MODEL or "flux",
+            "model": POLLINATIONS_IMAGE_MODEL,
             "prompt": prompt,
             "size": "1536x1024",
             "n": 1,
             "response_format": "b64_json",
         }
         req = urllib.request.Request(
-            url,
+            "https://gen.pollinations.ai/v1/images/generations",
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Authorization": f"Bearer {POLLINATIONS_API_KEY}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
+                "User-Agent": "RobotCompetitionAssistant/5.0",
             },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=IMAGE_TIMEOUT) as resp:
             raw = resp.read()
             status = getattr(resp, "status", 200)
-        print(f"POLLINATIONS_POST_STATUS: {status}", flush=True)
+        print("POLLINATIONS_POST_STATUS:", status, flush=True)
         data = json.loads(raw.decode("utf-8"))
         items = data.get("data") or []
         if items:
             item = items[0]
             if item.get("b64_json"):
                 image_bytes = base64.b64decode(item["b64_json"])
-                dest.write_bytes(image_bytes)
-                if dest.exists() and dest.stat().st_size > 5000:
-                    print(f"POLLINATIONS_IMAGE_SUCCESS: {dest} {dest.stat().st_size} bytes", flush=True)
+                if _is_valid_image_bytes(image_bytes, "image/png"):
+                    dest.write_bytes(image_bytes)
+                    print("POLLINATIONS_IMAGE_SUCCESS_B64:", dest.name, len(image_bytes), flush=True)
                     return True
-            if item.get("url") and _download_binary(item["url"], dest, timeout=IMAGE_TIMEOUT):
-                print(f"POLLINATIONS_IMAGE_SUCCESS_URL: {dest}", flush=True)
+            if item.get("url") and _download_binary(
+                item["url"],
+                dest,
+                headers={"User-Agent": "RobotCompetitionAssistant/5.0"},
+                timeout=IMAGE_TIMEOUT,
+            ):
+                print("POLLINATIONS_IMAGE_SUCCESS_URL:", dest.name, flush=True)
                 return True
     except urllib.error.HTTPError as exc:
         try:
             body = exc.read().decode("utf-8", errors="ignore")
         except Exception:
             body = ""
-        print(f"POLLINATIONS_POST_HTTP_ERROR: {exc.code} {exc.reason} {body[:1000]}", flush=True)
+        print("POLLINATIONS_POST_HTTP_ERROR:", exc.code, exc.reason, body[:800], flush=True)
     except Exception as exc:
         print("POLLINATIONS_POST_ERROR:", repr(exc), flush=True)
 
-    # 方式2：GET /image/{prompt} 兜底；key 放 query，避免部分代理丢 Authorization
+    # 方式2：GET image endpoint
     try:
         encoded = urllib.parse.quote(prompt[:1800], safe="")
         query = urllib.parse.urlencode({
-            "model": POLLINATIONS_IMAGE_MODEL or "flux",
+            "model": POLLINATIONS_IMAGE_MODEL,
             "width": 1280,
             "height": 768,
             "nologo": "true",
             "key": POLLINATIONS_API_KEY,
+            "seed": random.randint(10000, 99999999),
         })
         url = f"https://gen.pollinations.ai/image/{encoded}?{query}"
         req = urllib.request.Request(
             url,
-            headers={"User-Agent": "RobotCompetitionAssistant/3.0", "Accept": "image/*"},
+            headers={
+                "Authorization": f"Bearer {POLLINATIONS_API_KEY}",
+                "User-Agent": "RobotCompetitionAssistant/5.0",
+                "Accept": "image/*",
+            },
         )
         with urllib.request.urlopen(req, timeout=IMAGE_TIMEOUT) as resp:
-            image_bytes = resp.read()
-            content_type = (resp.headers.get("Content-Type") or "").lower()
-        print(f"POLLINATIONS_GET_STATUS: {content_type}, {len(image_bytes)} bytes", flush=True)
-        if len(image_bytes) > 5000 and (
-            "image/" in content_type
-            or image_bytes[:3] == b"\xff\xd8\xff"
-            or image_bytes[:8] == b"\x89PNG\r\n\x1a\n"
-        ):
-            dest.write_bytes(image_bytes)
-            print(f"POLLINATIONS_GET_SUCCESS: {dest}", flush=True)
+            data = resp.read()
+            ctype = resp.headers.get("Content-Type") or ""
+        if _is_valid_image_bytes(data, ctype):
+            dest.write_bytes(data)
+            print("POLLINATIONS_GET_SUCCESS:", dest.name, len(data), flush=True)
             return True
+        print("POLLINATIONS_GET_INVALID:", ctype, len(data), flush=True)
     except urllib.error.HTTPError as exc:
         try:
             body = exc.read().decode("utf-8", errors="ignore")
         except Exception:
             body = ""
-        print(f"POLLINATIONS_GET_HTTP_ERROR: {exc.code} {exc.reason} {body[:1000]}", flush=True)
+        print("POLLINATIONS_GET_HTTP_ERROR:", exc.code, exc.reason, body[:800], flush=True)
     except Exception as exc:
         print("POLLINATIONS_GET_ERROR:", repr(exc), flush=True)
-    return False
 
-def _commons_search_terms(report: Dict[str, Any], kind: str) -> str:
-    hint = _domain_hint(report)
-    if "pet care" in hint:
-        return "pet care robot cat feeder robot" if kind == "product" else "cat home smart pet feeder"
-    if "elder-care" in hint:
-        return "service robot elder care" if kind == "product" else "elderly home service robot"
-    if "kitchen" in hint:
-        return "kitchen service robot" if kind == "product" else "smart kitchen robot"
-    if "plant-care" in hint:
-        return "agricultural robot plant care" if kind == "product" else "smart irrigation potted plants"
-    if "educational" in hint:
-        return "educational robot" if kind == "product" else "robot child education"
-    if "cleaning" in hint:
-        return "home cleaning robot" if kind == "product" else "robot vacuum home"
-    if "agricultural" in hint:
-        return "agricultural robot" if kind == "product" else "farm robot greenhouse"
-    if "warehouse" in hint:
-        return "warehouse robot" if kind == "product" else "autonomous mobile robot warehouse"
-    return "service robot prototype" if kind == "product" else "service robot home"
-
-
-def _wikimedia_commons_image(report: Dict[str, Any], kind: str, dest: Path) -> bool:
-    """无需API Key的真实图片兜底。仅从Wikimedia Commons开放资源检索。"""
-    query = _commons_search_terms(report, kind)
-    params = {
-        "action": "query",
-        "generator": "search",
-        "gsrsearch": query,
-        "gsrnamespace": "6",
-        "gsrlimit": "8",
-        "prop": "imageinfo",
-        "iiprop": "url|mime",
-        "format": "json",
-        "origin": "*",
-    }
-    url = "https://commons.wikimedia.org/w/api.php?" + urllib.parse.urlencode(params)
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "RobotCompetitionAssistant/2.0"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        pages = list((data.get("query", {}).get("pages", {}) or {}).values())
-        for page in pages:
-            infos = page.get("imageinfo") or []
-            if not infos:
-                continue
-            info = infos[0]
-            mime = str(info.get("mime", "")).lower()
-            image_url = info.get("url")
-            if image_url and mime in {"image/jpeg", "image/png", "image/webp"}:
-                if _download_binary(image_url, dest, headers={"User-Agent": "RobotCompetitionAssistant/2.0"}, timeout=30):
-                    return True
-    except Exception as exc:
-        print("WIKIMEDIA_IMAGE_ERROR:", repr(exc), flush=True)
     return False
 
 
 def _generic_image_api(prompt: str, dest: Path) -> bool:
-    """兼容用户未来自建/其他图片服务。
-    约定POST JSON {prompt,width,height}，返回图片二进制，或JSON中的url字段。
-    """
     if not IMAGE_API_URL:
         return False
     body = json.dumps({"prompt": prompt, "width": 1280, "height": 768}, ensure_ascii=False).encode("utf-8")
@@ -1249,13 +1140,13 @@ def _generic_image_api(prompt: str, dest: Path) -> bool:
     try:
         req = urllib.request.Request(IMAGE_API_URL, data=body, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=IMAGE_TIMEOUT) as resp:
-            ctype = (resp.headers.get("Content-Type") or "").lower()
+            ctype = resp.headers.get("Content-Type") or ""
             data = resp.read()
-        if "image" in ctype and len(data) > 5000:
+        if _is_valid_image_bytes(data, ctype):
             dest.write_bytes(data)
             return True
         raw = json.loads(data.decode("utf-8"))
-        image_url = raw.get("url") or raw.get("image_url") or raw.get("data", {}).get("url")
+        image_url = raw.get("url") or raw.get("image_url") or (raw.get("data") or {}).get("url")
         if image_url:
             return _download_binary(image_url, dest, timeout=IMAGE_TIMEOUT)
     except Exception as exc:
@@ -1263,144 +1154,217 @@ def _generic_image_api(prompt: str, dest: Path) -> bool:
     return False
 
 
-def _fallback_robot_illustration(report: Dict[str, Any], dest: Path, scene: bool = False) -> None:
-    """离线兜底插画：不写中文文字，避免Render缺少中文字体出现方框。"""
-    W, H = 1280, 768
-    img = Image.new("RGB", (W, H), (246, 248, 251))
-    d = ImageDraw.Draw(img)
-    # environment
-    d.rectangle((0, 560, W, H), fill=(226, 232, 239))
-    d.rectangle((60, 90, 1220, 590), outline=(185, 197, 210), width=4)
-    # robot body
-    cx, cy = 650, 385
-    d.rounded_rectangle((cx-170, cy-150, cx+170, cy+135), radius=55, fill=(235, 240, 248), outline=(68, 91, 126), width=7)
-    d.rounded_rectangle((cx-115, cy-245, cx+115, cy-130), radius=45, fill=(248, 250, 253), outline=(68, 91, 126), width=7)
-    d.ellipse((cx-62, cy-210, cx-22, cy-170), fill=(70, 116, 176))
-    d.ellipse((cx+22, cy-210, cx+62, cy-170), fill=(70, 116, 176))
-    d.rounded_rectangle((cx-95, cy-70, cx+95, cy+20), radius=22, fill=(214, 225, 239), outline=(110, 130, 160), width=4)
-    d.ellipse((cx-160, cy+110, cx-80, cy+190), fill=(66, 77, 90))
-    d.ellipse((cx+80, cy+110, cx+160, cy+190), fill=(66, 77, 90))
-    # sensor rays
-    for dx in (-260, -210, 210, 260):
-        d.line((cx + (110 if dx>0 else -110), cy-180, cx+dx, cy-250), fill=(124, 151, 185), width=3)
-    # domain object cues
-    hint = _domain_hint(report)
-    if "pet care" in hint:
-        # pet bowl + cat silhouette
-        d.ellipse((200, 560, 360, 620), fill=(174, 191, 214), outline=(90, 110, 140), width=3)
-        d.polygon([(980,520),(1030,470),(1080,520)], fill=(115, 130, 150))
-        d.ellipse((940,500,1120,650), fill=(130,145,165))
-        d.polygon([(960,505),(980,455),(1015,505)], fill=(130,145,165))
-        d.polygon([(1045,505),(1080,455),(1100,510)], fill=(130,145,165))
-    elif "plant-care" in hint:
-        d.rectangle((160,540,340,670), fill=(181,149,118))
-        d.line((250,540,250,420), fill=(89,122,82), width=12)
-        d.ellipse((180,430,250,510), fill=(116,157,105)); d.ellipse((250,410,340,500), fill=(116,157,105))
-    elif "kitchen" in hint:
-        d.rectangle((100,420,360,620), fill=(203,210,218), outline=(110,120,130), width=4)
-        d.ellipse((150,450,220,520), outline=(160,80,60), width=5)
-    elif "educational" in hint:
-        d.rectangle((120,480,380,620), fill=(196,206,219), outline=(110,120,140), width=4)
-        d.rectangle((160,420,340,500), fill=(236,240,246), outline=(100,120,150), width=3)
-    if scene:
-        # add phone/status panel on right to suggest remote interaction
-        d.rounded_rectangle((1040,140,1180,390), radius=25, fill=(252,253,255), outline=(82,105,138), width=5)
-        d.ellipse((1090,170,1130,210), fill=(95,137,189))
-        for y in (245,285,325):
-            d.rounded_rectangle((1070,y,1150,y+16), radius=8, fill=(170,188,210))
-    img.save(dest, format="PNG")
-
-
-def _image_average_hash(path: Path, size: int = 16) -> Optional[int]:
+def _image_signature(path: Path) -> Optional[Tuple[int, ...]]:
     try:
         with Image.open(path) as im:
-            gray = im.convert("L").resize((size, size))
-            vals = list(gray.getdata())
-        avg = sum(vals) / len(vals)
-        bits = 0
-        for v in vals:
-            bits = (bits << 1) | int(v >= avg)
-        return bits
-    except Exception as exc:
-        print("IMAGE_HASH_ERROR:", repr(exc), flush=True)
+            im = im.convert("L").resize((16, 16))
+            return tuple(im.getdata())
+    except Exception:
         return None
 
 
-def _hash_similarity(a: Optional[int], b: Optional[int], bits: int = 256) -> float:
-    if a is None or b is None:
+def _image_similarity(path_a: Path, path_b: Path) -> float:
+    a = _image_signature(path_a)
+    b = _image_signature(path_b)
+    if not a or not b or len(a) != len(b):
         return 0.0
-    distance = (a ^ b).bit_count()
-    return 1.0 - distance / bits
+    mae = sum(abs(x - y) for x, y in zip(a, b)) / (len(a) * 255.0)
+    return max(0.0, min(1.0, 1.0 - mae))
 
 
-def _generate_required_ai_image(report: Dict[str, Any], kind: str, path: Path, max_attempts: int = 3) -> bool:
-    """正式报告图片必须由可用图片接口生成。
+def _diagram_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    return _find_cjk_font(size)
 
-    不再用简笔画伪装正式效果图。每张图最多重试3次。
-    """
-    for attempt in range(max_attempts):
-        prompt = _visual_prompt(report, kind, variant=attempt)
-        # 优先用户自建服务，其次 Pollinations。Wikimedia 不用于正式产品/场景效果图。
-        ok = _generic_image_api(prompt, path) or _pollinations_image(prompt, path)
-        if ok and path.exists() and path.stat().st_size > 5000:
-            print(f"REQUIRED_AI_IMAGE_SUCCESS: kind={kind} attempt={attempt+1} path={path}", flush=True)
-            return True
-        print(f"REQUIRED_AI_IMAGE_RETRY: kind={kind} attempt={attempt+1}", flush=True)
-    return False
+
+def _draw_centered_text(draw: ImageDraw.ImageDraw, box: Tuple[int, int, int, int], text: str, font: ImageFont.ImageFont, fill=(35, 45, 65)) -> None:
+    x1, y1, x2, y2 = box
+    lines = _wrap_text(draw, str(text), font, max(80, x2 - x1 - 30))[:3]
+    line_h = int(getattr(font, "size", 24) * 1.35)
+    total_h = line_h * len(lines)
+    y = y1 + (y2 - y1 - total_h) / 2
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        tw = bbox[2] - bbox[0]
+        draw.text((x1 + (x2 - x1 - tw) / 2, y), line, font=font, fill=fill)
+        y += line_h
+
+
+def _save_diagram(report: Dict[str, Any], kind: str, digest: str) -> Path:
+    width, height = 1400, 820
+    img = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(img)
+    font_title = _diagram_font(38)
+    font_head = _diagram_font(28)
+    font_body = _diagram_font(23)
+
+    title = report.get("project_title", "智能机器人项目")
+    fields = report.get("idea_fields", {})
+    funcs = [str(x) for x in fields.get("core_functions", [])[:5]]
+    techs = [str(x) for x in fields.get("tech_modules", [])[:5]]
+    scenes = [str(x) for x in fields.get("scenarios", [])[:3]]
+    targets = [str(x) for x in fields.get("target_groups", [])[:3]]
+
+    draw.rounded_rectangle((30, 30, width - 30, height - 30), radius=28, outline=(72, 93, 126), width=4)
+    header = {
+        "architecture": "系统框图（必备）",
+        "hardware": "软硬件功能关系图",
+        "workflow": "项目工作流程图（必备）",
+        "innovation": "创新点与差异化结构图",
+        "deployment": "项目落地路线图",
+    }.get(kind, "项目可视化")
+    draw.text((70, 60), header, font=font_title, fill=(25, 40, 70))
+
+    if kind == "architecture":
+        page3 = report.get("pages", {}).get("page_3", {}).get("content", {})
+        custom_modules = [str(x) for x in page3.get("core_modules", []) if str(x).strip()]
+        custom_suffix = " / ".join(custom_modules[-2:]) if custom_modules else ""
+        decision_text = "状态识别 / 信息融合 / 任务规划 / 安全判断"
+        if custom_suffix:
+            decision_text += " / " + custom_suffix
+        layers = [
+            ("输入/场景层", "用户指令 / " + " / ".join(scenes or ["实际场景"]) + " / 传感数据"),
+            ("感知处理层", "视觉识别 / 传感采集 / " + " / ".join(techs[:2] or ["数据预处理"])),
+            ("认知决策层", decision_text),
+            ("执行服务层", " / ".join(funcs[:4] or ["执行动作"]) + " / 本地控制"),
+            ("反馈交互层", "执行确认 / 异常提醒 / 数据记录 / 远程同步"),
+        ]
+        y = 145
+        fills = [(230,238,249), (228,242,239), (250,240,216), (231,241,226), (249,230,220)]
+        for i, (head, body) in enumerate(layers):
+            box = (125, y, 1275, y + 100)
+            draw.rounded_rectangle(box, radius=18, outline=(82, 103, 136), width=3, fill=fills[i])
+            draw.text((160, y + 18), head, font=font_head, fill=(25, 45, 75))
+            draw.text((430, y + 24), body, font=font_body, fill=(55, 65, 80))
+            if i < len(layers)-1:
+                draw.line((700, y + 103, 700, y + 130), fill=(70, 85, 110), width=4)
+                draw.polygon([(690,y+120),(710,y+120),(700,y+136)], fill=(70,85,110))
+            y += 130
+
+    elif kind == "hardware":
+        # left hardware, center controller, right software / outputs
+        draw.rounded_rectangle((80, 170, 420, 690), radius=24, outline=(86,106,138), width=3, fill=(237,243,250))
+        draw.text((170, 195), "硬件层", font=font_head, fill=(30,50,80))
+        hardware_items = (techs[:4] or ["传感器", "主控", "通信"]) + ["执行机构"]
+        y = 270
+        for item in hardware_items[:5]:
+            draw.rounded_rectangle((120,y,380,y+64), radius=16, outline=(130,145,165), width=2, fill="white")
+            _draw_centered_text(draw,(120,y,380,y+64),item,font_body)
+            y += 78
+
+        draw.rounded_rectangle((520, 300, 880, 555), radius=30, outline=(72,93,126), width=4, fill=(247,239,219))
+        _draw_centered_text(draw,(520,300,880,555),"中央控制与任务调度\n数据融合 · 状态判断 · 决策",font_head)
+
+        draw.rounded_rectangle((980, 170, 1320, 690), radius=24, outline=(86,106,138), width=3, fill=(237,248,241))
+        draw.text((1070, 195), "软件/服务层", font=font_head, fill=(30,50,80))
+        y = 270
+        for item in (funcs[:5] or ["智能服务"]):
+            draw.rounded_rectangle((1020,y,1280,y+64), radius=16, outline=(130,145,165), width=2, fill="white")
+            _draw_centered_text(draw,(1020,y,1280,y+64),item,font_body)
+            y += 78
+
+        for y0 in (350, 480):
+            draw.line((425,y0,510,y0), fill=(70,85,110), width=4)
+            draw.polygon([(500,y0-10),(520,y0),(500,y0+10)], fill=(70,85,110))
+            draw.line((885,y0,970,y0), fill=(70,85,110), width=4)
+            draw.polygon([(960,y0-10),(980,y0),(960,y0+10)], fill=(70,85,110))
+
+    elif kind == "workflow":
+        route = report.get("pages", {}).get("page_5", {}).get("content", {}).get("technical_route", [])
+        if not isinstance(route, list) or len(route) < 5:
+            route = ["数据采集", "预处理", "状态识别", "信息融合", "任务决策", "执行控制", "反馈记录"]
+        route = [str(x) for x in route[:7]]
+        x_positions = [65, 250, 435, 620, 805, 990, 1175][:len(route)]
+        y = 330
+        bw = 155
+        for i, (x, step) in enumerate(zip(x_positions, route)):
+            draw.rounded_rectangle((x, y, x+bw, y+120), radius=18, outline=(84,104,136), width=3, fill=(242,246,251))
+            _draw_centered_text(draw,(x,y,x+bw,y+120),step,font_body)
+            if i < len(route)-1:
+                x2 = x + bw
+                nx = x_positions[i+1]
+                draw.line((x2+8,y+60,nx-12,y+60), fill=(72,88,115), width=4)
+                draw.polygon([(nx-22,y+50),(nx-8,y+60),(nx-22,y+70)], fill=(72,88,115))
+        draw.rounded_rectangle((170, 560, 1230, 690), radius=22, outline=(125,138,158), width=2, fill=(250,247,237))
+        metric = "量化验证：" + " / ".join(report.get("pages", {}).get("page_5", {}).get("content", {}).get("engineering_metrics", [])[:4])
+        _draw_centered_text(draw,(170,560,1230,690),metric,font_body)
+
+    elif kind == "innovation":
+        points = report.get("pages", {}).get("page_6", {}).get("content", {}).get("innovation_points", [])
+        names = []
+        for p in points[:5]:
+            names.append(str(p.get("name") if isinstance(p, dict) else p))
+        names = names or ["真实需求驱动", "感知-决策-执行闭环", "多模块协同", "工程可实现", "可扩展设计"]
+        center = (700, 430)
+        draw.ellipse((535, 315, 865, 565), outline=(72,93,126), width=4, fill=(244,247,252))
+        _draw_centered_text(draw,(535,315,865,565),"项目创新核心",font_head)
+        positions = [(80,180),(1010,180),(50,590),(1040,590),(545,650)]
+        for name,(x,y) in zip(names,positions):
+            draw.rounded_rectangle((x,y,x+310,y+85), radius=18, outline=(120,135,155), width=3, fill=(250,250,250))
+            _draw_centered_text(draw,(x,y,x+310,y+85),name,font_body)
+            draw.line((x+155,y+42,center[0],center[1]), fill=(170,175,185), width=2)
+
+    elif kind == "deployment":
+        stages = report.get("pages", {}).get("page_7", {}).get("content", {}).get("deployment_paths", [])
+        stages = [str(x) for x in stages[:5]] or ["核心样机", "场景测试", "问题迭代", "模块化版本", "应用落地"]
+        xs = [90, 340, 590, 840, 1090]
+        for i,(x,stage) in enumerate(zip(xs,stages)):
+            draw.ellipse((x,330,x+150,480), outline=(72,93,126), width=4, fill=(240,245,251))
+            _draw_centered_text(draw,(x,330,x+150,480),f"{i+1}\n{stage}",font_body)
+            if i < len(stages)-1:
+                draw.line((x+160,405,xs[i+1]-10,405), fill=(72,88,115), width=4)
+                draw.polygon([(xs[i+1]-22,395),(xs[i+1]-8,405),(xs[i+1]-22,415)], fill=(72,88,115))
+        draw.rounded_rectangle((160,560,1240,680), radius=22, outline=(130,142,160), width=2, fill=(247,249,252))
+        _draw_centered_text(draw,(160,560,1240,680),"从竞赛样机 → 可验证原型 → 真实场景验证 → 可扩展产品化",font_head)
+
+    path = EXPORT_DIR / f"diagram_{kind}_{digest}.png"
+    img.save(path, format="PNG")
+    return path
 
 
 def generate_project_images(report: Dict[str, Any], session_key: str) -> Dict[str, str]:
-    """生成正式报告必备的两张AI图，并检查两图不能近似重复。
+    digest = hashlib.sha1(f"{session_key}-{report.get('project_title','')}-{report.get('generated_at','')}".encode("utf-8")).hexdigest()[:10]
+    result: Dict[str, str] = {}
 
-    第1页：产品英雄图；第2页：真实应用场景图。
-    如果AI接口失败，直接终止Word导出并给出明确错误，不再插入简笔兜底图。
-    """
-    # 把报告修订信息纳入文件指纹，用户修改图片要求后会生成全新文件。
-    revision_blob = json.dumps(
-        {
-            "title": report.get("project_title", ""),
-            "p1": report.get("pages", {}).get("page_1", {}).get("content", {}).get("visual_override", ""),
-            "p2": report.get("pages", {}).get("page_2", {}).get("content", {}).get("visual_override", ""),
-            "time": now_iso(),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    digest = hashlib.sha1(f"{session_key}-{revision_blob}".encode("utf-8")).hexdigest()[:10]
-    product = EXPORT_DIR / f"visual_product_{digest}.png"
-    scene = EXPORT_DIR / f"visual_scene_{digest}.png"
+    # 第1页：产品英雄图
+    hero_path = EXPORT_DIR / f"hero_{digest}.png"
+    hero_ok = _generic_image_api(_hero_prompt(report), hero_path) or _pollinations_image(_hero_prompt(report), hero_path)
+    if not hero_ok:
+        if STRICT_AI_IMAGES:
+            raise RuntimeError("AI产品展示图生成失败。请检查POLLINATIONS_API_KEY、模型权限和Render日志。")
+        print("AI_HERO_FALLBACK_DISABLED_BY_DESIGN", flush=True)
+    else:
+        result["hero"] = str(hero_path)
 
-    if not (POLLINATIONS_API_KEY or IMAGE_API_URL):
-        raise RuntimeError(
-            "正式AI图片服务未配置。请在Render环境变量中配置POLLINATIONS_API_KEY（或IMAGE_API_URL），"
-            "系统已禁止使用简笔兜底图生成正式报告。"
-        )
-
-    if not _generate_required_ai_image(report, "product", product, max_attempts=3):
-        raise RuntimeError("封面AI产品效果图生成失败；已重试3次。请检查图片API日志后重新导出。")
-
-    # 场景图允许最多3轮，每轮内部API也会尝试一次；若与产品图过于相似则强制重生成。
-    product_hash = _image_average_hash(product)
+    # 第2页：真实场景图。强制不同角色；若感知上过于接近，最多重生成3次。
+    scene_path = EXPORT_DIR / f"scene_{digest}.png"
     scene_ok = False
-    for variant in range(3):
-        prompt = _visual_prompt(report, "scene", variant=variant)
-        ok = _generic_image_api(prompt, scene) or _pollinations_image(prompt, scene)
-        if not ok or not scene.exists() or scene.stat().st_size <= 5000:
-            print(f"SCENE_IMAGE_RETRY: generation failed variant={variant}", flush=True)
+    for attempt in range(3):
+        candidate = EXPORT_DIR / f"scene_{digest}_{attempt}.png"
+        ok = _generic_image_api(_scene_prompt(report, attempt), candidate) or _pollinations_image(_scene_prompt(report, attempt), candidate)
+        if not ok:
             continue
-        similarity = _hash_similarity(product_hash, _image_average_hash(scene))
-        print(f"PRODUCT_SCENE_IMAGE_SIMILARITY: {similarity:.3f}", flush=True)
-        # aHash相似度过高时视为视觉重复；重新生成场景图。
-        if similarity >= 0.84:
-            print(f"SCENE_IMAGE_RETRY: too similar variant={variant}", flush=True)
-            continue
-        scene_ok = True
-        break
-
+        similarity = _image_similarity(hero_path, candidate) if hero_path.exists() else 0.0
+        print("IMAGE_ROLE_CHECK:", "attempt", attempt, "similarity", round(similarity, 3), flush=True)
+        if similarity < 0.84 or attempt == 2:
+            candidate.replace(scene_path)
+            scene_ok = True
+            break
     if not scene_ok:
-        raise RuntimeError("第2页AI应用场景图生成失败或与封面图过于相似；已自动重试，请再次导出或查看Render日志。")
+        if STRICT_AI_IMAGES:
+            raise RuntimeError("AI应用场景图生成失败。请检查POLLINATIONS图片接口日志。")
+    else:
+        result["scene"] = str(scene_path)
 
-    return {"product": str(product), "scene": str(scene)}
+    # 第3-7页：专业结构图，不依赖AI图片。
+    for kind in ["architecture", "hardware", "workflow", "innovation", "deployment"]:
+        try:
+            result[kind] = str(_save_diagram(report, kind, digest))
+        except Exception as exc:
+            print("DIAGRAM_ERROR:", kind, repr(exc), flush=True)
+            raise
+
+    return result
+
 
 # ============================================================
 # Word 美化与图文排版
@@ -1430,18 +1394,16 @@ def _add_heading(doc: Document, text: str, level: int = 1) -> None:
     p = doc.add_paragraph()
     r = p.add_run(text)
     _set_run_font(r, size=16 if level == 1 else 13, bold=True)
-    p.paragraph_format.space_before = Pt(6)
-    p.paragraph_format.space_after = Pt(3)
+    p.space_before = Pt(8)
+    p.space_after = Pt(4)
 
 
-def _add_paragraph(doc: Document, text: Any, bold_prefix: Optional[str] = None, first_line: bool = True) -> None:
-    if text is None or str(text).strip() == "":
+def _add_paragraph(doc: Document, text: Any, bold_prefix: Optional[str] = None) -> None:
+    if text is None:
         return
     p = doc.add_paragraph()
-    p.paragraph_format.line_spacing = 1.28
-    p.paragraph_format.space_after = Pt(3)
-    if first_line:
-        p.paragraph_format.first_line_indent = Cm(0.74)
+    p.paragraph_format.line_spacing = 1.35
+    p.paragraph_format.space_after = Pt(4)
     if bold_prefix and str(text).startswith(bold_prefix):
         r1 = p.add_run(bold_prefix)
         _set_run_font(r1, bold=True)
@@ -1452,15 +1414,7 @@ def _add_paragraph(doc: Document, text: Any, bold_prefix: Optional[str] = None, 
         _set_run_font(r)
 
 
-def _add_paragraphs(doc: Document, items: Any, limit: int = 10) -> None:
-    if isinstance(items, list):
-        for item in items[:limit]:
-            _add_paragraph(doc, item)
-    elif items:
-        _add_paragraph(doc, items)
-
-
-def _add_bullets(doc: Document, items: Any, limit: int = 10) -> None:
+def _add_bullets(doc: Document, items: Any, limit: int = 8) -> None:
     if not isinstance(items, list):
         if items:
             _add_paragraph(doc, items)
@@ -1469,16 +1423,15 @@ def _add_bullets(doc: Document, items: Any, limit: int = 10) -> None:
         p = doc.add_paragraph(style=None)
         p.paragraph_format.left_indent = Cm(0.55)
         p.paragraph_format.first_line_indent = Cm(-0.3)
-        p.paragraph_format.line_spacing = 1.2
-        p.paragraph_format.space_after = Pt(2)
+        p.paragraph_format.line_spacing = 1.25
         if isinstance(item, dict):
-            name = item.get("name") or item.get("title") or item.get("dimension") or item.get("function") or ""
-            desc = item.get("description") or item.get("implementation") or item.get("ours") or item.get("feedback") or ""
-            value = f"• {name}：{desc}" if desc else f"• {name}"
+            text = item.get("name") or item.get("title") or ""
+            desc = item.get("description") or item.get("implementation") or ""
+            value = f"• {text}：{desc}" if desc else f"• {text}"
         else:
             value = f"• {item}"
         r = p.add_run(value)
-        _set_run_font(r, size=10.2)
+        _set_run_font(r)
 
 
 def _add_image(doc: Document, path: Optional[str], caption: str, width_cm: float = 15.5) -> None:
@@ -1487,243 +1440,47 @@ def _add_image(doc: Document, path: Optional[str], caption: str, width_cm: float
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     r = p.add_run()
-    try:
-        r.add_picture(path, width=Cm(width_cm))
-    except Exception as exc:
-        print("WORD_IMAGE_INSERT_ERROR:", repr(exc), flush=True)
-        return
+    r.add_picture(path, width=Cm(width_cm))
     c = doc.add_paragraph()
     c.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    c.paragraph_format.space_after = Pt(3)
     rr = c.add_run(caption)
     _set_run_font(rr, size=9)
 
 
-def _style_table(table, header_fill: str = "DCE6F1", body_fill: Optional[str] = None) -> None:
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.style = "Table Grid"
-    for ridx, row in enumerate(table.rows):
-        for cell in row.cells:
-            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-            if ridx == 0:
-                _set_cell_shading(cell, header_fill)
-            elif body_fill:
-                _set_cell_shading(cell, body_fill)
-            for p in cell.paragraphs:
-                p.paragraph_format.space_after = Pt(0)
-                for run in p.runs:
-                    _set_run_font(run, size=9.5, bold=(ridx == 0))
-
-
-def _add_architecture_table(doc: Document, layers: List[str]) -> None:
-    _add_heading(doc, "系统总体架构", 2)
-    table = doc.add_table(rows=1, cols=2)
-    table.rows[0].cells[0].text = "层级"
-    table.rows[0].cells[1].text = "主要职责"
-    for item in layers[:6]:
-        if "：" in str(item):
-            a, b = str(item).split("：", 1)
-        else:
-            a, b = "模块", str(item)
-        cells = table.add_row().cells
-        cells[0].text = a
-        cells[1].text = b
-    _style_table(table)
-
-
-def _add_flow_table(doc: Document, steps: List[str]) -> None:
-    _add_heading(doc, "技术流程", 2)
-    steps = [str(s) for s in steps[:8] if s]
-    if not steps:
-        return
-    table = doc.add_table(rows=2, cols=len(steps))
-    for i, step in enumerate(steps):
-        table.rows[0].cells[i].text = f"步骤{i+1}"
-        table.rows[1].cells[i].text = step
-    _style_table(table)
-
-
-def _add_comparison_table(doc: Document, rows: List[Dict[str, Any]]) -> None:
-    _add_heading(doc, "差异化对比", 2)
-    table = doc.add_table(rows=1, cols=3)
-    table.rows[0].cells[0].text = "比较维度"
-    table.rows[0].cells[1].text = "常规方案"
-    table.rows[0].cells[2].text = "本项目"
-    for item in rows[:8]:
-        cells = table.add_row().cells
-        cells[0].text = str(item.get("dimension", ""))
-        cells[1].text = str(item.get("common", ""))
-        cells[2].text = str(item.get("ours", ""))
-    _style_table(table)
-
-
-def _add_function_matrix(doc: Document, rows: List[Dict[str, Any]]) -> None:
-    _add_heading(doc, "核心功能矩阵", 2)
-    table = doc.add_table(rows=1, cols=3)
-    table.rows[0].cells[0].text = "功能"
-    table.rows[0].cells[1].text = "触发方式"
-    table.rows[0].cells[2].text = "反馈方式"
-    for item in rows[:7]:
-        cells = table.add_row().cells
-        cells[0].text = str(item.get("function", ""))
-        cells[1].text = str(item.get("trigger", ""))
-        cells[2].text = str(item.get("feedback", ""))
-    _style_table(table)
-
-
-
-def _set_cell_text(cell, text: str, size: float = 9.5, bold: bool = False, align: int = WD_ALIGN_PARAGRAPH.CENTER) -> None:
-    cell.text = ""
-    p = cell.paragraphs[0]
-    p.alignment = align
-    p.paragraph_format.space_after = Pt(0)
-    r = p.add_run(str(text))
-    _set_run_font(r, size=size, bold=bold)
-    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-
-
-def _diagram_box(doc: Document, title: str, items: List[str], fill: str = "EAF2F8") -> None:
-    table = doc.add_table(rows=1, cols=1)
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    cell = table.cell(0, 0)
-    _set_cell_shading(cell, fill)
-    text = title
-    if items:
-        text += "\n" + " / ".join([str(x) for x in items if str(x).strip()][:5])
-    _set_cell_text(cell, text, size=9.8, bold=True)
-    tcPr = cell._tc.get_or_add_tcPr()
-    borders = tcPr.first_child_found_in("w:tcBorders")
-    if borders is None:
-        borders = OxmlElement("w:tcBorders")
-        tcPr.append(borders)
-    for edge in ("top", "left", "bottom", "right"):
-        tag = "w:" + edge
-        el = borders.find(qn(tag))
-        if el is None:
-            el = OxmlElement(tag)
-            borders.append(el)
-        el.set(qn("w:val"), "single")
-        el.set(qn("w:sz"), "10")
-        el.set(qn("w:color"), "5B9BD5")
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_after = Pt(0)
-
-
-def _add_system_block_diagram(doc: Document, diagram: Dict[str, Any]) -> None:
-    """报告必备系统框图：使用 Word 原生表格，不依赖服务器中文字体。"""
-    _add_heading(doc, "系统框图（必备）", 2)
-    stages = [
-        ("输入/场景层", diagram.get("inputs", []), "EAF2F8"),
-        ("感知处理层", diagram.get("perception", []), "DDEBF7"),
-        ("认知决策层", diagram.get("decision", []), "FFF2CC"),
-        ("执行服务层", diagram.get("execution", []), "E2F0D9"),
-        ("反馈交互层", diagram.get("feedback", []), "FCE4D6"),
-    ]
-    for i, (title, items, fill) in enumerate(stages):
-        _diagram_box(doc, title, [str(x) for x in items], fill)
-        if i < len(stages) - 1:
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            p.paragraph_format.space_after = Pt(0)
-            r = p.add_run("↓")
-            _set_run_font(r, size=15, bold=True)
-    cap = doc.add_paragraph()
-    cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    rr = cap.add_run("图3  项目系统总体框图")
-    _set_run_font(rr, size=9)
-
-
-def _add_hw_sw_block_diagram(doc: Document, diagram: Dict[str, Any]) -> None:
-    _add_heading(doc, "软硬件功能框图", 2)
-    table = doc.add_table(rows=2, cols=3)
-    headers = ["输入/感知端", "主控/软件决策", "执行/输出端"]
-    keys = ["input_side", "control_side", "output_side"]
-    fills = ["DDEBF7", "FFF2CC", "E2F0D9"]
-    for i, h in enumerate(headers):
-        _set_cell_shading(table.cell(0, i), fills[i])
-        _set_cell_text(table.cell(0, i), h, size=10, bold=True)
-        vals = diagram.get(keys[i], []) or []
-        _set_cell_text(table.cell(1, i), "\n↓\n".join([str(x) for x in vals[:5]]), size=9.3)
-    _style_table(table, header_fill="D9EAF7")
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = p.add_run("输入/感知 → 主控决策 → 执行输出，运行状态再回传形成闭环")
-    _set_run_font(r, size=9.3, bold=True)
-
-
-def _add_project_workflow_diagram(doc: Document, steps: List[str]) -> None:
-    """项目流程图：动态步骤，Word 原生可编辑。"""
-    _add_heading(doc, "项目工作流程图（必备）", 2)
-    steps = [str(s) for s in steps if str(s).strip()][:8]
-    if not steps:
-        return
-    cols = len(steps) * 2 - 1
-    table = doc.add_table(rows=1, cols=cols)
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    for i, step in enumerate(steps):
-        c = table.cell(0, i * 2)
-        _set_cell_shading(c, "EAF2F8" if i % 2 == 0 else "E2F0D9")
-        _set_cell_text(c, step, size=8.5, bold=True)
-        if i < len(steps) - 1:
-            _set_cell_text(table.cell(0, i * 2 + 1), "→", size=14, bold=True)
-    cap = doc.add_paragraph()
-    cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    rr = cap.add_run("图4  项目运行与任务闭环流程")
-    _set_run_font(rr, size=9)
-
-
-def _add_landing_roadmap(doc: Document, steps: List[str]) -> None:
-    _add_heading(doc, "项目落地路线图", 2)
-    steps = [str(s) for s in steps if str(s).strip()][:6]
-    if not steps:
-        return
-    table = doc.add_table(rows=len(steps), cols=2)
-    for i, step in enumerate(steps):
-        _set_cell_shading(table.cell(i, 0), "D9EAF7")
-        _set_cell_text(table.cell(i, 0), f"阶段 {i+1}", size=9.4, bold=True)
-        clean = re.sub(r"^阶段\d+[:：]", "", step)
-        _set_cell_text(table.cell(i, 1), clean, size=9.2, align=WD_ALIGN_PARAGRAPH.LEFT)
-    _style_table(table, header_fill="D9EAF7")
-
-
-def _add_revision_notes(doc: Document, content: Dict[str, Any]) -> None:
-    notes = content.get("user_requested_changes") or []
-    if not notes:
-        return
-    _add_heading(doc, "用户定制补充", 2)
-    _add_bullets(doc, notes, 8)
-
 def _prepare_document() -> Document:
     doc = Document()
     section = doc.sections[0]
-    section.top_margin = Cm(1.45)
-    section.bottom_margin = Cm(1.35)
-    section.left_margin = Cm(1.55)
-    section.right_margin = Cm(1.55)
+    section.top_margin = Cm(1.6)
+    section.bottom_margin = Cm(1.5)
+    section.left_margin = Cm(1.8)
+    section.right_margin = Cm(1.8)
 
     styles = doc.styles
     normal = styles["Normal"]
     normal.font.name = "Microsoft YaHei"
     normal._element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
-    normal.font.size = Pt(10.3)
+    normal.font.size = Pt(10.5)
     return doc
 
 
 def _render_cover(doc: Document, report: Dict[str, Any], images: Dict[str, str]) -> None:
     doc.add_paragraph("\n")
-    _add_title(doc, report.get("project_title", "智能机器人竞赛项目"), 22)
+    _add_title(doc, report.get("project_title", "智能机器人竞赛项目"), 23)
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     r = p.add_run("智能机器人创意竞赛 · 项目设计报告")
     _set_run_font(r, size=13)
-    _add_image(doc, images.get("product"), "图1  项目产品概念效果图", 15.8)
-
-    content = report.get("pages", {}).get("page_1", {}).get("content", {})
-    _add_paragraph(doc, content.get("design_statement", ""), first_line=False)
+    _add_image(doc, images.get("hero"), "图1  项目产品工业设计展示图")
 
     selected = report.get("selected_candidate", {})
+    c = report.get("pages", {}).get("page_1", {}).get("content", {})
+    statement = c.get("project_positioning") or selected.get("positioning", "")
+    if statement:
+        _add_paragraph(doc, statement)
+
     table = doc.add_table(rows=4, cols=2)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.style = "Table Grid"
     pairs = [
         ("项目定位", selected.get("positioning", "")),
         ("核心技术", selected.get("core_tech", "")),
@@ -1733,8 +1490,12 @@ def _render_cover(doc: Document, report: Dict[str, Any], images: Dict[str, str])
     for row, (k, v) in zip(table.rows, pairs):
         row.cells[0].text = k
         row.cells[1].text = str(v)
-    _style_table(table, header_fill="E8EEF7")
-
+        _set_cell_shading(row.cells[0], "E8EEF7")
+        for ccell in row.cells:
+            ccell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            for pp in ccell.paragraphs:
+                for run in pp.runs:
+                    _set_run_font(run, size=9.5, bold=(ccell is row.cells[0]))
 
 def _render_page(doc: Document, report: Dict[str, Any], page_no: int, images: Dict[str, str]) -> None:
     page = report["pages"][f"page_{page_no}"]
@@ -1742,83 +1503,67 @@ def _render_page(doc: Document, report: Dict[str, Any], page_no: int, images: Di
     _add_heading(doc, f"第{page_no}页  {page.get('title', '')}", 1)
 
     if page_no == 2:
-        _add_image(doc, images.get("scene"), "图2  项目典型应用场景效果图", 15.2)
+        _add_image(doc, images.get("scene"), "图2  项目真实任务应用场景图")
         _add_heading(doc, "设计背景", 2)
-        _add_paragraphs(doc, content.get("background_paragraphs") or content.get("background", []), 4)
+        _add_bullets(doc, content.get("background", []), 5)
         _add_heading(doc, "用户痛点", 2)
-        _add_bullets(doc, content.get("pain_points", []), 6)
-        _add_heading(doc, "用户需求", 2)
-        _add_bullets(doc, content.get("user_needs", []), 6)
+        _add_bullets(doc, content.get("pain_points", []), 5)
         _add_heading(doc, "设计目标", 2)
-        _add_bullets(doc, content.get("design_goals", []), 6)
+        _add_bullets(doc, content.get("design_goals", []), 5)
 
     elif page_no == 3:
-        _add_paragraph(doc, content.get("overview", ""))
-        diagram = content.get("system_block_diagram") or {
-            "inputs": ["用户指令", "场景/对象状态", "传感器数据"],
-            "perception": ["多源感知", "数据预处理"],
-            "decision": ["状态识别", "任务规划", "安全判断"],
-            "execution": content.get("core_modules", [])[:4],
-            "feedback": ["执行确认", "异常提醒", "远程同步"],
-        }
-        _add_system_block_diagram(doc, diagram)
-        _add_architecture_table(doc, content.get("system_layers", []))
+        _add_image(doc, images.get("architecture"), "图3  系统框图（必备）", 13.8)
+        _add_heading(doc, "系统分层", 2)
+        _add_bullets(doc, content.get("system_layers", []), 6)
         _add_heading(doc, "核心模块", 2)
-        _add_bullets(doc, content.get("core_modules", []), 7)
+        _add_bullets(doc, content.get("core_modules", []), 6)
         _add_heading(doc, "本体结构思路", 2)
         _add_paragraph(doc, content.get("mechanical_concept", ""))
-        _add_heading(doc, "结构设计原则", 2)
-        _add_bullets(doc, content.get("design_principles", []), 6)
 
     elif page_no == 4:
-        _add_hw_sw_block_diagram(doc, content.get("hardware_software_block", {}))
+        _add_image(doc, images.get("hardware"), "图4  软硬件功能关系图", 13.8)
         _add_heading(doc, "硬件设计", 2)
-        _add_bullets(doc, content.get("hardware", []), 8)
+        _add_bullets(doc, content.get("hardware", []), 6)
         _add_heading(doc, "软件功能", 2)
-        _add_bullets(doc, content.get("software", []), 8)
-        _add_function_matrix(doc, content.get("functional_matrix", []))
+        _add_bullets(doc, content.get("software", []), 6)
         _add_heading(doc, "交互逻辑", 2)
-        _add_paragraph(doc, content.get("interaction_logic", ""), first_line=False)
+        _add_paragraph(doc, content.get("interaction_logic", ""))
 
     elif page_no == 5:
-        _add_paragraph(doc, content.get("technical_summary", ""))
-        _add_project_workflow_diagram(doc, content.get("project_workflow") or content.get("technical_route", []))
-        _add_flow_table(doc, content.get("technical_route", []))
+        _add_image(doc, images.get("workflow"), "图5  项目工作流程图（必备）", 13.8)
         _add_heading(doc, "关键技术", 2)
-        _add_bullets(doc, content.get("key_technologies", []), 6)
+        _add_bullets(doc, content.get("key_technologies", []), 3)
         _add_heading(doc, "量化指标", 2)
-        _add_bullets(doc, content.get("engineering_metrics", []), 6)
-        _add_heading(doc, "风险控制", 2)
-        _add_bullets(doc, content.get("risk_control", []), 6)
+        _add_bullets(doc, content.get("engineering_metrics", []), 3)
 
     elif page_no == 6:
-        _add_paragraph(doc, content.get("innovation_intro", ""))
+        _add_image(doc, images.get("innovation"), "图6  创新点与差异化结构图", 13.8)
         _add_heading(doc, "创新点", 2)
-        _add_bullets(doc, content.get("innovation_points", []), 7)
-        _add_comparison_table(doc, content.get("comparison", []))
+        _add_bullets(doc, content.get("innovation_points", []), 6)
         diff = content.get("differentiation_analysis", {})
-        note = diff.get("current_boundary") if isinstance(diff, dict) else None
-        if note:
+        boundary = diff.get("current_boundary", "") if isinstance(diff, dict) else ""
+        if boundary:
             _add_heading(doc, "知识库说明", 2)
-            _add_paragraph(doc, note)
+            _add_paragraph(doc, boundary)
 
     elif page_no == 7:
-        _add_paragraphs(doc, content.get("prospect_paragraphs", []), 4)
-        _add_heading(doc, "典型应用场景", 2)
-        _add_bullets(doc, content.get("application_scenarios", []), 6)
-        _add_landing_roadmap(doc, content.get("deployment_paths", []))
+        _add_image(doc, images.get("deployment"), "图7  项目落地路线图", 13.8)
+        _add_heading(doc, "应用场景", 2)
+        _add_bullets(doc, content.get("application_scenarios", []), 3)
         _add_heading(doc, "社会价值", 2)
-        _add_bullets(doc, content.get("social_value", []), 6)
+        _add_bullets(doc, content.get("social_value", []), 3)
         _add_heading(doc, "后续迭代", 2)
-        _add_bullets(doc, content.get("future_iterations", []), 6)
-
-    _add_revision_notes(doc, content)
+        _add_bullets(doc, content.get("future_iterations", []), 3)
 
 def export_report_to_word(report_json: Dict[str, Any], session_key: str) -> Dict[str, str]:
     images = generate_project_images(report_json, session_key)
+    required = ["hero", "scene", "architecture", "hardware", "workflow", "innovation", "deployment"]
+    missing = [k for k in required if not images.get(k) or not Path(images[k]).exists()]
+    if missing:
+        raise RuntimeError("缺少必要可视化：" + ", ".join(missing))
+
     doc = _prepare_document()
     _render_cover(doc, report_json, images)
-
     for page_no in range(2, 8):
         doc.add_page_break()
         _render_page(doc, report_json, page_no, images)
@@ -1826,8 +1571,6 @@ def export_report_to_word(report_json: Dict[str, Any], session_key: str) -> Dict
     digest = hashlib.sha1(
         f"{session_key}-{report_json.get('project_title','')}-{now_iso()}".encode("utf-8")
     ).hexdigest()[:12]
-
-    # 下载URL永远使用ASCII文件名，避免学习通/浏览器截断中文链接。
     filename = f"robot_competition_report_{digest}.docx"
     path = EXPORT_DIR / filename
     doc.save(path)
@@ -1836,48 +1579,70 @@ def export_report_to_word(report_json: Dict[str, Any], session_key: str) -> Dict
         "filename": filename,
         "file_path": str(path),
         "download_url": f"{PUBLIC_BASE_URL}/api/v1/robot-competition/download/{filename}",
-        "visual_mode": "ai_generated_required",
+        "visual_mode": "ai_plus_native_diagrams",
     }
 
-# ============================================================
-# 意图识别与会话流程
-# ============================================================
 def detect_page_number(message: str) -> Optional[int]:
     text = normalize_text(message)
-    cn = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7}
     for pattern in [r"第([1-7])页", r"page([1-7])", r"页([1-7])"]:
         m = re.search(pattern, text, re.I)
         if m:
             return int(m.group(1))
-    m = re.search(r"第([一二三四五六七])页", text)
-    if m:
-        return cn.get(m.group(1))
-    # 用户未写页码时，根据明确模块自动路由到对应页面
-    if contains_any(text, ["系统框图", "系统架构", "总体结构", "整体结构"]):
-        return 3
-    if contains_any(text, ["软硬件", "硬件设计", "软件功能", "功能框图"]):
-        return 4
-    if contains_any(text, ["项目流程图", "工作流程图", "技术路线", "流程图"]):
-        return 5
-    if contains_any(text, ["创新点", "差异化", "对比图"]):
-        return 6
-    if contains_any(text, ["行业前景", "应用前景", "落地路线", "落地路径"]):
-        return 7
-    if contains_any(text, ["设计背景", "用户需求", "用户痛点"]):
-        return 2
-    if contains_any(text, ["封面", "项目题目", "标题"]):
-        return 1
     return None
+
+
+def _looks_like_new_project_idea(message: str) -> bool:
+    text = (message or "").strip()
+    norm = normalize_text(text)
+    if len(text) < 18:
+        return False
+    if contains_any(norm, ["修改第", "调整第", "补充第", "下载报告", "生成报告", "查看报告"]):
+        return False
+    robot_signal = contains_any(norm, ["机器人", "智能小车", "机械臂", "无人车", "无人机"])
+    function_signal = contains_any(norm, [
+        "可以", "能够", "用于", "主要", "自动", "识别", "检测", "提醒", "清理", "巡检",
+        "搬运", "陪伴", "照护", "浇水", "喂食", "导航", "报警", "通知",
+    ])
+    return robot_signal and function_signal
+
+
+def _report_ready(session: Dict[str, Any]) -> bool:
+    return isinstance(session.get("report_json"), dict) and bool(session.get("report_json"))
 
 
 def detect_intent(message: str, session: Dict[str, Any]) -> str:
     text = normalize_text(message)
+    report_ready = _report_ready(session)
+
+    # 全局控制
+    if contains_any(text, ["开始新项目", "新建项目", "重新开始", "清空当前项目"]):
+        return "reset_project"
+
+    # 报告生成后的操作：修改、查看、下载
+    if report_ready:
+        if contains_any(text, ["查看报告结构", "查看结构化数据", "查看json"]):
+            return "view_report_json"
+        if contains_any(text, ["修改第", "调整第", "改第", "补充第"]) and detect_page_number(message):
+            return "modify_page_request"
+        if contains_any(text, ["修改系统框图", "优化系统框图", "调整系统框图"]):
+            return "modify_system_diagram"
+        if contains_any(text, ["修改流程图", "优化流程图", "调整流程图", "修改项目流程"]):
+            return "modify_workflow"
+        if contains_any(text, ["下载", "导出", "生成word", "word报告", "word文档"]) and contains_any(text, ["报告", "word", "文档", "方案书"]):
+            return "word_export_pending"
+        if contains_any(text, ["不满意", "我要修改", "需要修改"]):
+            return "report_revision_help"
+        # 用户在旧报告后输入一条完整新创意，自动开启新项目
+        if _looks_like_new_project_idea(message):
+            return "create_project"
+
+    # 报告未生成时禁止进入修改逻辑
+    if contains_any(text, ["修改第", "调整第", "改第", "补充第", "修改系统框图", "修改流程图"]):
+        return "modify_before_report"
+
     if contains_any(text, ["查看报告结构", "查看结构化数据", "查看json"]):
         return "view_report_json"
-    revision_words = ["修改", "调整", "更改", "改成", "补充", "增加", "新增", "删除", "删掉", "替换", "优化"]
-    if session.get("report_json") and contains_any(text, revision_words):
-        return "modify_page_request"
-    if contains_any(text, ["重新生成", "重生成", "再生成", "换一批", "不满意"]):
+    if contains_any(text, ["重新生成", "重生成", "再生成", "换一批"]):
         return "regenerate_titles"
     if re.fullmatch(r"[123]", text) or contains_any(text, ["选1", "选2", "选3", "第一个", "第二个", "第三个"]):
         return "select_title"
@@ -1900,6 +1665,58 @@ def parse_selection(message: str) -> Optional[int]:
     return None
 
 
+def _apply_local_page_revision(page: Dict[str, Any], page_no: int, request_text: str) -> Dict[str, Any]:
+    """没有LLM时也保证用户修改会真实进入报告。"""
+    content = page.setdefault("content", {})
+    request_text = (request_text or "").strip()
+
+    module_match = re.search(r"增加([^，。；;]{1,24}?)(?:模块|功能|节点)", request_text)
+    step_match = re.search(r"增加([^，。；;]{1,24}?)(?:步骤|环节|流程)", request_text)
+
+    if page_no == 1:
+        old = str(content.get("project_positioning", "")).strip()
+        content["project_positioning"] = (old + "；用户修改要求：" + request_text).strip("；")
+
+    elif page_no == 2:
+        goals = content.setdefault("design_goals", [])
+        goals.append("用户修改要求：" + request_text)
+
+    elif page_no == 3:
+        modules = content.setdefault("core_modules", [])
+        if module_match:
+            name = module_match.group(1).strip() + "模块"
+            if name not in modules:
+                modules.append(name)
+        else:
+            modules.append("用户定制：" + request_text)
+
+    elif page_no == 4:
+        software = content.setdefault("software", [])
+        software.append("用户定制：" + request_text)
+
+    elif page_no == 5:
+        route = content.setdefault("technical_route", [])
+        if step_match:
+            name = step_match.group(1).strip()
+            if name and name not in route:
+                route.append(name)
+        elif module_match:
+            techs = content.setdefault("key_technologies", [])
+            name = module_match.group(1).strip() + "模块"
+            techs.append({"name": name, "implementation": "按用户要求纳入技术路线，并配置可验证输入、处理、输出及测试指标。"})
+        else:
+            route.append("用户定制：" + request_text)
+
+    elif page_no == 6:
+        points = content.setdefault("innovation_points", [])
+        points.append({"name": "用户定制创新", "description": request_text})
+
+    elif page_no == 7:
+        future = content.setdefault("future_iterations", [])
+        future.append("用户定制：" + request_text)
+
+    return page
+
 def response(**kwargs: Any) -> ChatResponse:
     kwargs.setdefault("payload_json", "")
     kwargs.setdefault("download_url", "")
@@ -1910,42 +1727,6 @@ def response(**kwargs: Any) -> ChatResponse:
     return ChatResponse(**kwargs)
 
 
-
-def _apply_local_revision(report_json: Dict[str, Any], page_no: int, request: str) -> None:
-    key = f"page_{page_no}"
-    page = report_json.get("pages", {}).get(key)
-    if not isinstance(page, dict):
-        return
-    content = page.setdefault("content", {})
-    notes = content.setdefault("user_requested_changes", [])
-    if request not in notes:
-        notes.append(request)
-
-    # 常见修改可直接落地，不依赖外部LLM。
-    text = request.strip()
-    if page_no == 1:
-        m = re.search(r"(?:题目|标题).{0,8}(?:改成|修改为|更改为|换成)[：:\s]*[“\"']?(.+?)[”\"']?$", text)
-        if m and m.group(1).strip():
-            new_title = m.group(1).strip().strip("。")
-            report_json["project_title"] = new_title
-            page["title"] = new_title
-            if isinstance(report_json.get("selected_candidate"), dict):
-                report_json["selected_candidate"]["title"] = new_title
-        if contains_any(normalize_text(text), ["图片", "效果图", "产品图", "画面", "机器人外观"]):
-            content["visual_override"] = text
-    elif page_no == 2 and contains_any(normalize_text(text), ["图片", "场景图", "效果图", "画面", "场景"]):
-        content["visual_override"] = text
-    elif page_no == 3 and contains_any(normalize_text(text), ["知识库", "云端", "大模型"]):
-        diag = content.setdefault("system_block_diagram", {})
-        decision = diag.setdefault("decision", [])
-        addition = "知识库/智能推理"
-        if addition not in decision:
-            decision.append(addition)
-    elif page_no == 5 and contains_any(normalize_text(text), ["测试", "验证", "评价"]):
-        flow = content.setdefault("project_workflow", [])
-        if "测试验证与指标评价" not in flow:
-            flow.append("测试验证与指标评价")
-
 def handle_chat(req: ChatRequest) -> ChatResponse:
     session_key = build_session_key(req)
     session = load_session(session_key)
@@ -1954,6 +1735,43 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
 
     print("DEBUG_MESSAGE:", user_message, "INTENT:", intent, flush=True)
     print("DEBUG_SESSION:", session_key, "SESSION_KEYS:", list(session.keys()), flush=True)
+
+    if intent == "reset_project":
+        session = {}
+        save_session(session_key, session)
+        return response(
+            success=True,
+            stage="idle",
+            intent=intent,
+            message="当前项目状态已重置。请直接输入一个新的机器人创意。",
+            suggested_actions=["输入新的机器人创意"],
+        )
+
+    if intent == "modify_before_report":
+        return response(
+            success=False,
+            stage="report_not_ready",
+            intent=intent,
+            message="当前还没有生成7页报告。请先完成：输入创意 → 选择1/2/3 → 输入“生成报告”。报告生成后才能修改具体页面、系统框图或流程图。",
+            suggested_actions=["生成报告"],
+        )
+
+    if intent == "report_revision_help":
+        return response(
+            success=True,
+            stage="report_revision_ready",
+            intent=intent,
+            message="可以修改。请直接说明要改哪一页，例如：\n“修改第3页，在系统框图中增加云端知识库模块”\n“修改第5页，把项目流程增加测试验证和失败回退步骤”。\n修改完成后再输入“下载报告”即可导出最新版。",
+            suggested_actions=["修改第3页", "修改第5页", "下载报告"],
+        )
+
+    if intent == "modify_system_diagram":
+        user_message = "修改第3页，" + user_message
+        intent = "modify_page_request"
+
+    if intent == "modify_workflow":
+        user_message = "修改第5页，" + user_message
+        intent = "modify_page_request"
 
     if intent in {"create_project", "supplement_idea", "regenerate_titles"}:
         if intent == "create_project":
@@ -2084,26 +1902,18 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             )
         page_no = detect_page_number(user_message)
         if not page_no:
-            return response(
-                success=False,
-                stage="modify_need_target",
-                intent=intent,
-                message="可以修改。请告诉我要修改第1至第7页中的哪一页，例如：‘修改第3页，在系统框图中增加云端知识库模块’。",
-                suggested_actions=["修改第3页系统框图", "修改第5页项目流程图", "修改第6页创新点"],
-            )
+            return response(success=False, stage="modify_failed", intent=intent, message="请明确要修改第1至第7页中的哪一页。")
 
         key = f"page_{page_no}"
         page = report_json["pages"].get(key, {})
         page.setdefault("revision_notes", [])
         page["revision_notes"].append(user_message)
+        page = _apply_local_page_revision(page, page_no, user_message)
+        report_json["pages"][key] = page
 
-        # 先执行本地可确定的修改，保证没有外部LLM时也确实发生变化。
-        _apply_local_revision(report_json, page_no, user_message)
-        page = report_json["pages"].get(key, page)
-
-        # 如配置LLM，再按自然语言做更深入的重写。
+        # 有LLM时进一步按用户要求重写该页；没有LLM时，上面的本地修改也会真实进入Word。
         ai = call_llm_json(
-            "你是竞赛报告编辑专家。只返回JSON对象，保持page_no/module/title/content结构。严格依据用户修改要求重写该页；系统框图、流程图等结构字段必须保留为可渲染的列表/字典。",
+            "你是竞赛报告编辑专家。只返回JSON对象，保持page_no/module/title/content结构，按修改要求重写这一页。",
             json.dumps({"page": page, "request": user_message, "project_title": report_json.get("project_title")}, ensure_ascii=False),
         )
         if ai and isinstance(ai, dict):
@@ -2111,10 +1921,7 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             ai.setdefault("module", page.get("module"))
             ai.setdefault("title", page.get("title"))
             ai.setdefault("content", page.get("content"))
-            # 保留本地修改记录
             ai["revision_notes"] = page.get("revision_notes", [])
-            local_notes = page.get("content", {}).get("user_requested_changes", [])
-            ai.setdefault("content", {}).setdefault("user_requested_changes", local_notes)
             report_json["pages"][key] = ai
 
         session["report_json"] = report_json
@@ -2124,13 +1931,10 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             success=True,
             stage="report_json_ready",
             intent=intent,
-            message=(
-                f"已完成第{page_no}页修改。当前版本：{session['report_revision']}。\n"
-                "你可以继续提出修改要求，或输入‘下载报告’重新导出最新版Word。"
-            ),
+            message=f"已记录并处理第{page_no}页修改要求。当前版本：{session['report_revision']}。",
             payload_json=json.dumps(report_json, ensure_ascii=False, indent=2),
             data={"report_json": report_json, "revision": session["report_revision"]},
-            suggested_actions=["下载报告", "继续修改第3页", "修改第5页流程图"],
+            suggested_actions=["下载报告", "继续修改其他页面"],
         )
 
     if intent == "word_export_pending":
@@ -2168,7 +1972,7 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             intent=intent,
             message=(
                 "Word报告已经生成完成。\n\n"
-                "文档已按7页竞赛报告结构排版：第3页强制包含系统框图，第5页强制包含项目工作流程图，并配套AI项目效果图、软硬件功能框图、差异化对比与落地路线图。\n\n"
+                "文档已按7页竞赛报告结构排版：第1页AI产品展示图、第2页AI真实应用场景图、第3页系统框图、第4页软硬件功能关系图、第5页项目工作流程图、第6页创新结构图、第7页落地路线图。\n\n"
                 "请点击下方链接下载 .docx 文件："
             ),
             payload_json=json.dumps(report_json, ensure_ascii=False, indent=2),
