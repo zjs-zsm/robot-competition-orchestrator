@@ -153,16 +153,12 @@ def delete_raw_file(object_key: str | None) -> None:
 
 
 def configured_users() -> dict[str, dict[str, str]]:
-    users: dict[str, dict[str, str]] = {}
-    admin_user = os.getenv("ADMIN_USERNAME", "").strip()
-    admin_pass = os.getenv("ADMIN_PASSWORD", "")
-    teacher_user = os.getenv("TEACHER_USERNAME", "").strip()
-    teacher_pass = os.getenv("TEACHER_PASSWORD", "")
-    if admin_user and admin_pass:
-        users[admin_user] = {"password": admin_pass, "role": "admin"}
-    if teacher_user and teacher_pass:
-        users[teacher_user] = {"password": teacher_pass, "role": "teacher"}
-    return users
+    """One shared login for the owner and teacher."""
+    username = os.getenv("SHARED_USERNAME", "").strip() or os.getenv("ADMIN_USERNAME", "").strip()
+    password = os.getenv("SHARED_PASSWORD", "") or os.getenv("ADMIN_PASSWORD", "")
+    if username and password:
+        return {username: {"password": password, "role": "admin"}}
+    return {}
 
 
 def current_user(request: Request) -> dict[str, str] | None:
