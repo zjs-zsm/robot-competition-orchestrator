@@ -22,8 +22,10 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship,
 
 try:
     import boto3
+    from botocore.config import Config as BotoConfig
 except ImportError:
     boto3 = None
+    BotoConfig = None
 
 APP_VERSION = "0.2.0"
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(25 * 1024 * 1024)))
@@ -34,16 +36,57 @@ KB_API_KEY = os.getenv("KB_API_KEY", "")
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() not in {"0", "false", "no"}
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+# Preferred storage: Neon Object Storage (S3-compatible, no separate card-based R2 setup).
+# Legacy Cloudflare R2 variables remain supported for backward compatibility.
+AWS_ENDPOINT_URL_S3 = os.getenv("AWS_ENDPOINT_URL_S3", "").strip()
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "").strip()
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "").strip()
+AWS_REGION = os.getenv("AWS_REGION", "us-east-2").strip() or "us-east-2"
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "").strip()
+
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "").strip()
 R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL", "").strip() or (f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else "")
-R2_ENABLED = bool(boto3 and R2_ENDPOINT_URL and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET_NAME)
-R2_CLIENT = boto3.client(
-    "s3", endpoint_url=R2_ENDPOINT_URL, aws_access_key_id=R2_ACCESS_KEY_ID,
-    aws_secret_access_key=R2_SECRET_ACCESS_KEY, region_name="auto"
-) if R2_ENABLED else None
+
+if AWS_ENDPOINT_URL_S3:
+    OBJECT_STORAGE_ENDPOINT_URL = AWS_ENDPOINT_URL_S3
+    OBJECT_STORAGE_ACCESS_KEY_ID = AWS_ACCESS_KEY_ID
+    OBJECT_STORAGE_SECRET_ACCESS_KEY = AWS_SECRET_ACCESS_KEY
+    OBJECT_STORAGE_BUCKET_NAME = S3_BUCKET_NAME
+    OBJECT_STORAGE_REGION = AWS_REGION
+    OBJECT_STORAGE_PROVIDER = "neon_object_storage"
+elif R2_ENDPOINT_URL:
+    OBJECT_STORAGE_ENDPOINT_URL = R2_ENDPOINT_URL
+    OBJECT_STORAGE_ACCESS_KEY_ID = R2_ACCESS_KEY_ID
+    OBJECT_STORAGE_SECRET_ACCESS_KEY = R2_SECRET_ACCESS_KEY
+    OBJECT_STORAGE_BUCKET_NAME = R2_BUCKET_NAME
+    OBJECT_STORAGE_REGION = "auto"
+    OBJECT_STORAGE_PROVIDER = "cloudflare_r2"
+else:
+    OBJECT_STORAGE_ENDPOINT_URL = ""
+    OBJECT_STORAGE_ACCESS_KEY_ID = ""
+    OBJECT_STORAGE_SECRET_ACCESS_KEY = ""
+    OBJECT_STORAGE_BUCKET_NAME = ""
+    OBJECT_STORAGE_REGION = "us-east-2"
+    OBJECT_STORAGE_PROVIDER = "database_blob"
+
+OBJECT_STORAGE_ENABLED = bool(
+    boto3 and OBJECT_STORAGE_ENDPOINT_URL and OBJECT_STORAGE_ACCESS_KEY_ID
+    and OBJECT_STORAGE_SECRET_ACCESS_KEY and OBJECT_STORAGE_BUCKET_NAME
+)
+OBJECT_STORAGE_CLIENT = boto3.client(
+    "s3",
+    endpoint_url=OBJECT_STORAGE_ENDPOINT_URL,
+    aws_access_key_id=OBJECT_STORAGE_ACCESS_KEY_ID,
+    aws_secret_access_key=OBJECT_STORAGE_SECRET_ACCESS_KEY,
+    region_name=OBJECT_STORAGE_REGION,
+    config=BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"}),
+) if OBJECT_STORAGE_ENABLED else None
+R2_ENABLED = OBJECT_STORAGE_ENABLED and OBJECT_STORAGE_PROVIDER == "cloudflare_r2"
+R2_CLIENT = OBJECT_STORAGE_CLIENT if R2_ENABLED else None
 if DATABASE_URL:
     if DATABASE_URL.startswith("postgres://"):
         DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgres://"):]
@@ -126,11 +169,14 @@ def utcnow() -> datetime:
 
 
 def store_raw_file(raw: bytes, digest: str, filename: str, content_type: str) -> tuple[bytes | None, str | None]:
-    """Use Cloudflare R2 when configured; otherwise retain the bytes in the database."""
-    if R2_ENABLED and R2_CLIENT:
+    """Use configured S3-compatible object storage; otherwise retain bytes in the database."""
+    if OBJECT_STORAGE_ENABLED and OBJECT_STORAGE_CLIENT:
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(filename).name)[:180] or "file"
         key = f"documents/{digest}/{safe_name}"
-        R2_CLIENT.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=raw, ContentType=content_type or "application/octet-stream")
+        OBJECT_STORAGE_CLIENT.put_object(
+            Bucket=OBJECT_STORAGE_BUCKET_NAME, Key=key, Body=raw,
+            ContentType=content_type or "application/octet-stream"
+        )
         # Old SQLite schemas may still require file_data; duplicate only for that legacy case.
         return (raw if FILE_DATA_NOT_NULL else None), key
     return raw, None
@@ -138,9 +184,9 @@ def store_raw_file(raw: bytes, digest: str, filename: str, content_type: str) ->
 
 def read_raw_file(doc: "KnowledgeDocument") -> bytes:
     if doc.object_key:
-        if not (R2_ENABLED and R2_CLIENT):
-            raise RuntimeError("该文件存储在 R2，但当前服务尚未配置 R2 凭据。")
-        response = R2_CLIENT.get_object(Bucket=R2_BUCKET_NAME, Key=doc.object_key)
+        if not (OBJECT_STORAGE_ENABLED and OBJECT_STORAGE_CLIENT):
+            raise RuntimeError("该文件存储在对象存储中，但当前服务尚未配置对象存储凭据。")
+        response = OBJECT_STORAGE_CLIENT.get_object(Bucket=OBJECT_STORAGE_BUCKET_NAME, Key=doc.object_key)
         return response["Body"].read()
     if doc.file_data is None:
         raise RuntimeError("文件内容不存在。")
@@ -148,8 +194,8 @@ def read_raw_file(doc: "KnowledgeDocument") -> bytes:
 
 
 def delete_raw_file(object_key: str | None) -> None:
-    if object_key and R2_ENABLED and R2_CLIENT:
-        R2_CLIENT.delete_object(Bucket=R2_BUCKET_NAME, Key=object_key)
+    if object_key and OBJECT_STORAGE_ENABLED and OBJECT_STORAGE_CLIENT:
+        OBJECT_STORAGE_CLIENT.delete_object(Bucket=OBJECT_STORAGE_BUCKET_NAME, Key=object_key)
 
 
 def configured_users() -> dict[str, dict[str, str]]:
@@ -434,7 +480,7 @@ def health():
         chunks = db.scalar(select(func.count()).select_from(KnowledgeChunk)) or 0
     return {"ok": True, "service": "robot-competition-knowledge-base", "version": APP_VERSION,
             "documents": count, "chunks": chunks, "database": "postgresql" if DATABASE_URL else "sqlite",
-            "object_storage": "cloudflare_r2" if R2_ENABLED else "database_blob"}
+            "object_storage": OBJECT_STORAGE_PROVIDER if OBJECT_STORAGE_ENABLED else "database_blob"}
 
 
 @app.get("/api/v1/kb/documents")
