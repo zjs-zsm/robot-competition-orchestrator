@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import (
     DateTime, ForeignKey, Integer, LargeBinary, String, Text, create_engine,
-    select, func, event
+    select, func, event, inspect as sa_inspect, text
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
@@ -97,6 +97,16 @@ class KnowledgeChunk(Base):
 
 
 Base.metadata.create_all(engine)
+# Safe schema migration for an existing knowledge-base database.
+with engine.begin() as connection:
+    columns = {column["name"]: column for column in sa_inspect(engine).get_columns("knowledge_documents")}
+    if "object_key" not in columns:
+        connection.execute(text("ALTER TABLE knowledge_documents ADD COLUMN object_key VARCHAR(1024)"))
+    if engine.dialect.name == "postgresql":
+        connection.execute(text("ALTER TABLE knowledge_documents ALTER COLUMN file_data DROP NOT NULL"))
+        columns = {column["name"]: column for column in sa_inspect(engine).get_columns("knowledge_documents")}
+FILE_DATA_NOT_NULL = not columns["file_data"]["nullable"]
+
 serializer = URLSafeTimedSerializer(SESSION_SECRET, salt="robot-competition-kb-session") if SESSION_SECRET else None
 
 app = FastAPI(
@@ -121,7 +131,8 @@ def store_raw_file(raw: bytes, digest: str, filename: str, content_type: str) ->
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(filename).name)[:180] or "file"
         key = f"documents/{digest}/{safe_name}"
         R2_CLIENT.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=raw, ContentType=content_type or "application/octet-stream")
-        return None, key
+        # Old SQLite schemas may still require file_data; duplicate only for that legacy case.
+        return (raw if FILE_DATA_NOT_NULL else None), key
     return raw, None
 
 
@@ -427,7 +438,7 @@ def health():
         chunks = db.scalar(select(func.count()).select_from(KnowledgeChunk)) or 0
     return {"ok": True, "service": "robot-competition-knowledge-base", "version": APP_VERSION,
             "documents": count, "chunks": chunks, "database": "postgresql" if DATABASE_URL else "sqlite",
-            "object_storage": "cloudflare_r2" if R2_ENABLED else "database_blob"
+            "object_storage": "cloudflare_r2" if R2_ENABLED else "database_blob"}
 
 
 @app.get("/api/v1/kb/documents")
