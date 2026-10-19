@@ -13,10 +13,8 @@
 ## 必需环境变量
 
 - `SESSION_SECRET`: 至少 32 字符的随机秘密，用于签名登录 cookie。
-- `ADMIN_USERNAME`: 管理员账号。
-- `ADMIN_PASSWORD`: 管理员强密码。
-- `TEACHER_USERNAME`: 老师账号。
-- `TEACHER_PASSWORD`: 老师强密码。
+- `SHARED_USERNAME`: 你和老师共用的登录账号。
+- `SHARED_PASSWORD`: 你和老师共用的强密码。
 - `KB_API_KEY`: V4.1.0 调用检索 API 的长随机密钥。
 - `DATABASE_URL`: Render PostgreSQL 的 Internal Database URL（推荐）。未设置时使用 SQLite，但临时磁盘数据可能在重新部署/重启后丢失。
 - `COOKIE_SECURE`: 公网 HTTPS 保持 true。
@@ -31,7 +29,7 @@
 
 ## 注意
 
-1. 上传后直接入库，无人工审核。
+1. 你和老师共用同一个登录账号；上传后直接入库，无人工审核。
 2. 文件大小默认 25 MB，单次最多 30 个。
 3. 当前使用关键词/字符 n-gram 检索，不是语义向量检索。
 4. 扫描版 PDF 和图片会保存，但当前版本尚未接 OCR，因此不能从纯图片中自动检索文字。
