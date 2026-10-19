@@ -20,7 +20,12 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
-APP_VERSION = "0.1.0"
+try:
+    import boto3
+except ImportError:
+    boto3 = None
+
+APP_VERSION = "0.2.0"
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(25 * 1024 * 1024)))
 MAX_UPLOADS = int(os.getenv("MAX_UPLOADS", "30"))
 COOKIE_NAME = "robot_kb_session"
@@ -29,6 +34,16 @@ KB_API_KEY = os.getenv("KB_API_KEY", "")
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() not in {"0", "false", "no"}
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "").strip()
+R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL", "").strip() or (f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else "")
+R2_ENABLED = bool(boto3 and R2_ENDPOINT_URL and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET_NAME)
+R2_CLIENT = boto3.client(
+    "s3", endpoint_url=R2_ENDPOINT_URL, aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY, region_name="auto"
+) if R2_ENABLED else None
 if DATABASE_URL:
     if DATABASE_URL.startswith("postgres://"):
         DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgres://"):]
@@ -61,7 +76,8 @@ class KnowledgeDocument(Base):
     original_name: Mapped[str] = mapped_column(String(255), nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
     content_type: Mapped[str] = mapped_column(String(160), default="application/octet-stream")
-    file_data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    file_data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    object_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     extracted_text: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(40), default="已入库")
     uploaded_by: Mapped[str] = mapped_column(String(80), default="unknown")
@@ -97,6 +113,32 @@ ALLOWED_EXTENSIONS = {
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def store_raw_file(raw: bytes, digest: str, filename: str, content_type: str) -> tuple[bytes | None, str | None]:
+    """Use Cloudflare R2 when configured; otherwise retain the bytes in the database."""
+    if R2_ENABLED and R2_CLIENT:
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(filename).name)[:180] or "file"
+        key = f"documents/{digest}/{safe_name}"
+        R2_CLIENT.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=raw, ContentType=content_type or "application/octet-stream")
+        return None, key
+    return raw, None
+
+
+def read_raw_file(doc: "KnowledgeDocument") -> bytes:
+    if doc.object_key:
+        if not (R2_ENABLED and R2_CLIENT):
+            raise RuntimeError("该文件存储在 R2，但当前服务尚未配置 R2 凭据。")
+        response = R2_CLIENT.get_object(Bucket=R2_BUCKET_NAME, Key=doc.object_key)
+        return response["Body"].read()
+    if doc.file_data is None:
+        raise RuntimeError("文件内容不存在。")
+    return bytes(doc.file_data)
+
+
+def delete_raw_file(object_key: str | None) -> None:
+    if object_key and R2_ENABLED and R2_CLIENT:
+        R2_CLIENT.delete_object(Bucket=R2_BUCKET_NAME, Key=object_key)
 
 
 def configured_users() -> dict[str, dict[str, str]]:
@@ -384,7 +426,8 @@ def health():
         count = db.scalar(select(func.count()).select_from(KnowledgeDocument)) or 0
         chunks = db.scalar(select(func.count()).select_from(KnowledgeChunk)) or 0
     return {"ok": True, "service": "robot-competition-knowledge-base", "version": APP_VERSION,
-            "documents": count, "chunks": chunks, "database": "postgresql" if DATABASE_URL else "sqlite"}
+            "documents": count, "chunks": chunks, "database": "postgresql" if DATABASE_URL else "sqlite",
+            "object_storage": "cloudflare_r2" if R2_ENABLED else "database_blob"
 
 
 @app.get("/api/v1/kb/documents")
@@ -432,10 +475,15 @@ async def upload_documents(request: Request, files: list[UploadFile] = File(...)
                 results.append({"name": filename, "status": f"重复文件，已跳过（已有：{existing.original_name}）"})
                 continue
         extracted, status = extract_text(filename, raw)
+        try:
+            file_data, object_key = store_raw_file(raw, digest, filename, upload.content_type or "application/octet-stream")
+        except Exception as exc:
+            results.append({"name": filename, "status": "文件存储失败：" + type(exc).__name__})
+            continue
         doc = KnowledgeDocument(
             original_name=filename[:255], sha256=digest,
             content_type=upload.content_type or "application/octet-stream",
-            file_data=raw, extracted_text=extracted, status=status,
+            file_data=file_data, object_key=object_key, extracted_text=extracted, status=status,
             uploaded_by=user["username"], created_at=utcnow(),
         )
         doc.chunks = [KnowledgeChunk(chunk_index=i, content=piece) for i, piece in enumerate(chunk_text(extracted))]
@@ -446,7 +494,8 @@ async def upload_documents(request: Request, files: list[UploadFile] = File(...)
                 results.append({"name": filename, "status": status, "document_id": doc.id, "indexed_chunks": len(doc.chunks)})
             except Exception:
                 db.rollback()
-                results.append({"name": filename, "status": "保存失败，请检查数据库容量或日志"})
+                delete_raw_file(object_key)
+                results.append({"name": filename, "status": "保存失败，请检查数据库连接或日志"})
     ok = sum(1 for x in results if "document_id" in x)
     return {"success": True, "uploaded": ok, "items": results,
             "message": f"处理完成：成功入库 {ok} 个文件；未入库或跳过 {len(results)-ok} 个。"}
@@ -459,8 +508,10 @@ def delete_document(document_id: int, request: Request):
         doc = db.get(KnowledgeDocument, document_id)
         if not doc:
             raise HTTPException(status_code=404, detail="资料不存在")
+        object_key = doc.object_key
         db.delete(doc)
         db.commit()
+    delete_raw_file(object_key)
     return {"success": True, "deleted_id": document_id}
 
 
@@ -471,7 +522,10 @@ def download_document(document_id: int, request: Request):
         doc = db.get(KnowledgeDocument, document_id)
         if not doc:
             raise HTTPException(status_code=404, detail="资料不存在")
-        raw = bytes(doc.file_data)
+        try:
+            raw = read_raw_file(doc)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="无法读取原始文件，请检查对象存储配置。") from exc
         name = doc.original_name.replace('"', "")
         mime = doc.content_type
     return Response(content=raw, media_type=mime, headers={
