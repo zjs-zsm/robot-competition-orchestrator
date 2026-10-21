@@ -160,17 +160,21 @@ FILE_DATA_NOT_NULL = True
 
 
 def initialize_database() -> bool:
-    """Initialize or migrate the database without blocking the web server import."""
+    """Initialize SQLite locally; reuse the already-migrated Render PostgreSQL schema."""
     global DATABASE_READY, DATABASE_INIT_ERROR, FILE_DATA_NOT_NULL
     try:
         logger.info("Starting database initialization (dialect=%s).", engine.dialect.name)
-        Base.metadata.create_all(engine)
         if engine.dialect.name == "postgresql":
-            # The existing PostgreSQL database has already been migrated. Avoid a
-            # full pg_catalog column introspection on every boot; it can block behind
-            # concurrent DDL and prevent the knowledge base from becoming ready.
+            # Render's existing production database already contains both knowledge-base
+            # tables and the object_key migration. Re-running SQLAlchemy create_all()
+            # triggers PostgreSQL catalog introspection that can be blocked by DDL locks.
+            # Reuse the known deployed schema and let real queries surface any schema issue.
             FILE_DATA_NOT_NULL = False
+            with engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+            logger.info("PostgreSQL connection verified; reusing existing schema.")
         else:
+            Base.metadata.create_all(engine)
             with engine.begin() as connection:
                 columns = {
                     column["name"]: column
@@ -180,7 +184,7 @@ def initialize_database() -> bool:
                     connection.execute(
                         text("ALTER TABLE knowledge_documents ADD COLUMN object_key VARCHAR(1024)")
                     )
-            FILE_DATA_NOT_NULL = not columns["file_data"]["nullable"]
+                FILE_DATA_NOT_NULL = not columns["file_data"]["nullable"]
         DATABASE_READY = True
         DATABASE_INIT_ERROR = ""
         logger.info("Database initialization completed successfully.")
@@ -190,7 +194,6 @@ def initialize_database() -> bool:
         DATABASE_INIT_ERROR = f"{type(exc).__name__}: {exc}"
         logger.exception("Database initialization failed.")
         return False
-
 
 async def initialize_database_background() -> None:
     """Retry database initialization in the background so the HTTP port can open."""
