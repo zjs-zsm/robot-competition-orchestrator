@@ -15,6 +15,7 @@ from typing import Any
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
+from pdf_extractor import extract_pdf_text
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import (
     DateTime, ForeignKey, Integer, LargeBinary, String, Text, create_engine,
@@ -35,7 +36,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("robot_competition_knowledge_base")
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(25 * 1024 * 1024)))
 MAX_UPLOADS = int(os.getenv("MAX_UPLOADS", "30"))
 COOKIE_NAME = "robot_kb_session"
@@ -379,9 +380,10 @@ input[type=text]{padding:11px;border:1px solid #cbd5e1;border-radius:10px;font-s
 <script>
 async function api(url,options={}){const r=await fetch(url,options);if(r.status===401){location.href="/login";throw new Error("登录已过期，请重新登录")}let data={};try{data=await r.json()}catch{}if(!r.ok)throw new Error(data.detail||"请求失败");return data}
 function setStatus(id,text,kind=""){const el=document.getElementById(id);el.textContent=text;el.className="status "+kind}
-async function loadData(){try{const d=await api("/api/v1/kb/documents");document.getElementById("docCount").textContent=d.total_documents;document.getElementById("chunkCount").textContent=d.total_chunks;document.getElementById("statusCount").textContent=d.needs_attention;document.getElementById("who").textContent=d.username+"（"+(d.role==="admin"?"管理员":"老师")+"）";const tbody=document.getElementById("docs");tbody.replaceChildren();if(!d.documents.length){const tr=document.createElement("tr"),td=document.createElement("td");td.colSpan=5;td.textContent="还没有资料，请先上传";tr.append(td);tbody.append(tr)}for(const doc of d.documents){const tr=document.createElement("tr");const td1=document.createElement("td");td1.className="file";td1.textContent=doc.original_name;const td2=document.createElement("td");td2.textContent=doc.uploaded_by;const td3=document.createElement("td");const pill=document.createElement("span");pill.className="pill";pill.textContent=doc.status;td3.append(pill);const td4=document.createElement("td");td4.textContent=doc.created_at;const td5=document.createElement("td");const row=document.createElement("div");row.className="row";const dl=document.createElement("button");dl.className="secondary";dl.textContent="下载";dl.onclick=()=>location.href="/api/v1/kb/documents/"+doc.id+"/download";const del=document.createElement("button");del.className="danger";del.textContent="删除";del.onclick=()=>deleteDoc(doc.id,doc.original_name);row.append(dl,del);td5.append(row);tr.append(td1,td2,td3,td4,td5);tbody.append(tr)}}catch(e){setStatus("uploadStatus",e.message,"err")}}
+async function loadData(){try{const d=await api("/api/v1/kb/documents");document.getElementById("docCount").textContent=d.total_documents;document.getElementById("chunkCount").textContent=d.total_chunks;document.getElementById("statusCount").textContent=d.needs_attention;document.getElementById("who").textContent=d.username+"（"+(d.role==="admin"?"管理员":"老师")+"）";const tbody=document.getElementById("docs");tbody.replaceChildren();if(!d.documents.length){const tr=document.createElement("tr"),td=document.createElement("td");td.colSpan=5;td.textContent="还没有资料，请先上传";tr.append(td);tbody.append(tr)}for(const doc of d.documents){const tr=document.createElement("tr");const td1=document.createElement("td");td1.className="file";td1.textContent=doc.original_name;const td2=document.createElement("td");td2.textContent=doc.uploaded_by;const td3=document.createElement("td");const pill=document.createElement("span");pill.className="pill";pill.textContent=doc.status;td3.append(pill);const td4=document.createElement("td");td4.textContent=doc.created_at;const td5=document.createElement("td");const row=document.createElement("div");row.className="row";const dl=document.createElement("button");dl.className="secondary";dl.textContent="下载";dl.onclick=()=>location.href="/api/v1/kb/documents/"+doc.id+"/download";const del=document.createElement("button");del.className="danger";del.textContent="删除";del.onclick=()=>deleteDoc(doc.id,doc.original_name);if(doc.original_name.toLowerCase().endsWith(".pdf")){const reparse=document.createElement("button");reparse.className="secondary";reparse.textContent="重新解析";reparse.onclick=()=>reindexDoc(doc.id,doc.original_name);row.append(dl,reparse,del)}else{row.append(dl,del)}td5.append(row);tr.append(td1,td2,td3,td4,td5);tbody.append(tr)}}catch(e){setStatus("uploadStatus",e.message,"err")}}
 async function uploadFiles(){const input=document.getElementById("files");if(!input.files.length){setStatus("uploadStatus","请先选择文件","err");return}const fd=new FormData();for(const f of input.files)fd.append("files",f);const b=document.getElementById("uploadBtn");b.disabled=true;b.textContent="上传处理中…";setStatus("uploadStatus","正在上传、提取文字并建立索引，请不要关闭页面");try{const d=await api("/api/v1/kb/upload",{method:"POST",body:fd});setStatus("uploadStatus",d.message+"\n"+d.items.map(x=>x.name+"："+x.status).join("\n"),"ok");input.value="";await loadData()}catch(e){setStatus("uploadStatus",e.message,"err")}finally{b.disabled=false;b.textContent="上传并自动入库"}}
 async function searchKb(){const q=document.getElementById("query").value.trim();if(!q){setStatus("searchStatus","请输入检索内容","err");return}setStatus("searchStatus","正在检索…");const box=document.getElementById("results");box.replaceChildren();try{const d=await api("/api/v1/knowledge/search",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({query:q,top_k:8})});setStatus("searchStatus","找到 "+d.results.length+" 条相关资料", "ok");for(const r of d.results){const item=document.createElement("div");item.className="result";const title=document.createElement("b");title.textContent=r.title;const p=document.createElement("p");p.textContent=r.content;const sm=document.createElement("small");sm.textContent="来源："+r.source+" · 相关度："+Math.round((r.similarity||0)*100)+"%";item.append(title,p,sm);box.append(item)}}catch(e){setStatus("searchStatus",e.message,"err")}}
+async function reindexDoc(id,name){if(!confirm("重新解析“"+name+"”？系统会保留原文件，只重建文本索引。"))return;setStatus("uploadStatus","正在重新解析 "+name+"，请不要关闭页面");try{const d=await api("/api/v1/kb/documents/"+id+"/reindex",{method:"POST"});setStatus("uploadStatus",d.message+"（索引片段："+d.indexed_chunks+"）","ok");await loadData()}catch(e){setStatus("uploadStatus",e.message,"err")}}
 async function deleteDoc(id,name){if(!confirm("确定删除“"+name+"”？删除后该资料将不再被智能体检索。"))return;try{await api("/api/v1/kb/documents/"+id,{method:"DELETE"});await loadData()}catch(e){alert(e.message)}}
 loadData();
 </script></body></html>"""
@@ -391,10 +393,7 @@ def extract_text(filename: str, raw: bytes) -> tuple[str, str]:
     ext = Path(filename).suffix.lower()
     try:
         if ext == ".pdf":
-            from pypdf import PdfReader
-            reader = PdfReader(io.BytesIO(raw))
-            text = "\n".join((page.extract_text() or "") for page in reader.pages)
-            return text.strip(), "已入库" if text.strip() else "已保存（需OCR）"
+            return extract_pdf_text(raw)
         if ext == ".docx":
             from docx import Document
             doc = Document(io.BytesIO(raw))
@@ -634,6 +633,56 @@ async def upload_documents(request: Request, files: list[UploadFile] = File(...)
     ok = sum(1 for x in results if "document_id" in x)
     return {"success": True, "uploaded": ok, "items": results,
             "message": f"处理完成：成功入库 {ok} 个文件；未入库或跳过 {len(results)-ok} 个。"}
+
+
+@app.post("/api/v1/kb/documents/{document_id}/reindex")
+def reindex_document(document_id: int, request: Request):
+    """Re-extract a saved file and atomically replace its search index without deleting the original."""
+    require_user(request)
+    with SessionLocal() as db:
+        doc = db.get(KnowledgeDocument, document_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="资料不存在")
+        filename = doc.original_name
+        try:
+            raw = read_raw_file(doc)
+        except Exception as exc:
+            logger.exception("Could not read original file for reindexing (document_id=%s).", document_id)
+            raise HTTPException(
+                status_code=503,
+                detail="无法读取原始文件，请检查 Neon 对象存储配置。原有索引未更改。",
+            ) from exc
+
+    extracted, status = extract_text(filename, raw)
+    if not extracted.strip() or not status.startswith("已入库"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{status}。原有索引未更改；请检查 OCR 依赖和 PDF 文件质量。",
+        )
+
+    pieces = chunk_text(extracted)
+    if not pieces:
+        raise HTTPException(status_code=422, detail="没有提取到可检索文字，原有索引未更改。")
+
+    with SessionLocal() as db:
+        doc = db.get(KnowledgeDocument, document_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="资料不存在")
+        doc.extracted_text = extracted
+        doc.status = status
+        doc.chunks = [
+            KnowledgeChunk(chunk_index=index, content=piece)
+            for index, piece in enumerate(pieces)
+        ]
+        db.commit()
+
+    return {
+        "success": True,
+        "document_id": document_id,
+        "status": status,
+        "indexed_chunks": len(pieces),
+        "message": f"重新解析完成：{status}，已重建检索索引。",
+    }
 
 
 @app.delete("/api/v1/kb/documents/{document_id}")
