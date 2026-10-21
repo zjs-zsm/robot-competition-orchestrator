@@ -165,24 +165,22 @@ def initialize_database() -> bool:
     try:
         logger.info("Starting database initialization (dialect=%s).", engine.dialect.name)
         Base.metadata.create_all(engine)
-        with engine.begin() as connection:
-            columns = {
-                column["name"]: column
-                for column in sa_inspect(engine).get_columns("knowledge_documents")
-            }
-            if "object_key" not in columns:
-                connection.execute(
-                    text("ALTER TABLE knowledge_documents ADD COLUMN object_key VARCHAR(1024)")
-                )
-            if engine.dialect.name == "postgresql":
-                connection.execute(
-                    text("ALTER TABLE knowledge_documents ALTER COLUMN file_data DROP NOT NULL")
-                )
+        if engine.dialect.name == "postgresql":
+            # The existing PostgreSQL database has already been migrated. Avoid a
+            # full pg_catalog column introspection on every boot; it can block behind
+            # concurrent DDL and prevent the knowledge base from becoming ready.
+            FILE_DATA_NOT_NULL = False
+        else:
+            with engine.begin() as connection:
                 columns = {
                     column["name"]: column
                     for column in sa_inspect(engine).get_columns("knowledge_documents")
                 }
-        FILE_DATA_NOT_NULL = not columns["file_data"]["nullable"]
+                if "object_key" not in columns:
+                    connection.execute(
+                        text("ALTER TABLE knowledge_documents ADD COLUMN object_key VARCHAR(1024)")
+                    )
+            FILE_DATA_NOT_NULL = not columns["file_data"]["nullable"]
         DATABASE_READY = True
         DATABASE_INIT_ERROR = ""
         logger.info("Database initialization completed successfully.")
