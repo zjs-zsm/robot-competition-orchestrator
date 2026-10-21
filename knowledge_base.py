@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
+import logging
 import io
 import json
 import os
@@ -26,6 +28,12 @@ try:
 except ImportError:
     boto3 = None
     BotoConfig = None
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("robot_competition_knowledge_base")
 
 APP_VERSION = "0.2.0"
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(25 * 1024 * 1024)))
@@ -92,7 +100,14 @@ if DATABASE_URL:
         DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgres://"):]
     elif DATABASE_URL.startswith("postgresql://") and "+psycopg" not in DATABASE_URL:
         DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgresql://"):]
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        connect_args={
+            "connect_timeout": 8,
+            "options": "-c statement_timeout=15000 -c lock_timeout=5000",
+        },
+    )
 else:
     db_path = Path(os.getenv("KB_DB_PATH", "/tmp/robot_kb.sqlite3"))
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -139,16 +154,53 @@ class KnowledgeChunk(Base):
     document: Mapped[KnowledgeDocument] = relationship(back_populates="chunks")
 
 
-Base.metadata.create_all(engine)
-# Safe schema migration for an existing knowledge-base database.
-with engine.begin() as connection:
-    columns = {column["name"]: column for column in sa_inspect(engine).get_columns("knowledge_documents")}
-    if "object_key" not in columns:
-        connection.execute(text("ALTER TABLE knowledge_documents ADD COLUMN object_key VARCHAR(1024)"))
-    if engine.dialect.name == "postgresql":
-        connection.execute(text("ALTER TABLE knowledge_documents ALTER COLUMN file_data DROP NOT NULL"))
-        columns = {column["name"]: column for column in sa_inspect(engine).get_columns("knowledge_documents")}
-FILE_DATA_NOT_NULL = not columns["file_data"]["nullable"]
+DATABASE_READY = False
+DATABASE_INIT_ERROR = ""
+FILE_DATA_NOT_NULL = True
+
+
+def initialize_database() -> bool:
+    """Initialize or migrate the database without blocking the web server import."""
+    global DATABASE_READY, DATABASE_INIT_ERROR, FILE_DATA_NOT_NULL
+    try:
+        logger.info("Starting database initialization (dialect=%s).", engine.dialect.name)
+        Base.metadata.create_all(engine)
+        with engine.begin() as connection:
+            columns = {
+                column["name"]: column
+                for column in sa_inspect(engine).get_columns("knowledge_documents")
+            }
+            if "object_key" not in columns:
+                connection.execute(
+                    text("ALTER TABLE knowledge_documents ADD COLUMN object_key VARCHAR(1024)")
+                )
+            if engine.dialect.name == "postgresql":
+                connection.execute(
+                    text("ALTER TABLE knowledge_documents ALTER COLUMN file_data DROP NOT NULL")
+                )
+                columns = {
+                    column["name"]: column
+                    for column in sa_inspect(engine).get_columns("knowledge_documents")
+                }
+        FILE_DATA_NOT_NULL = not columns["file_data"]["nullable"]
+        DATABASE_READY = True
+        DATABASE_INIT_ERROR = ""
+        logger.info("Database initialization completed successfully.")
+        return True
+    except Exception as exc:
+        DATABASE_READY = False
+        DATABASE_INIT_ERROR = f"{type(exc).__name__}: {exc}"
+        logger.exception("Database initialization failed.")
+        return False
+
+
+async def initialize_database_background() -> None:
+    """Retry database initialization in the background so the HTTP port can open."""
+    while not DATABASE_READY:
+        if await asyncio.to_thread(initialize_database):
+            return
+        logger.warning("Database is not ready; retrying initialization in 10 seconds.")
+        await asyncio.sleep(10)
 
 serializer = URLSafeTimedSerializer(SESSION_SECRET, salt="robot-competition-kb-session") if SESSION_SECRET else None
 
@@ -157,6 +209,13 @@ app = FastAPI(
     version=APP_VERSION,
     description="仅限授权用户上传，上传后自动入库，并为 V4.1.0 智能体提供检索 API。",
 )
+
+
+@app.on_event("startup")
+async def start_database_initialization() -> None:
+    # Do not wait for PostgreSQL migrations before binding Render's HTTP port.
+    asyncio.create_task(initialize_database_background())
+
 
 ALLOWED_EXTENSIONS = {
     ".pdf", ".docx", ".pptx", ".xlsx", ".csv", ".txt", ".md", ".json",
@@ -225,10 +284,20 @@ def current_user(request: Request) -> dict[str, str] | None:
     return None
 
 
+def require_database_ready() -> None:
+    if not DATABASE_READY:
+        if DATABASE_INIT_ERROR:
+            detail = "数据库暂不可用，请稍后重试；管理员请检查 Render 服务日志。"
+        else:
+            detail = "数据库正在初始化，请稍后重试。"
+        raise HTTPException(status_code=503, detail=detail)
+
+
 def require_user(request: Request) -> dict[str, str]:
     user = current_user(request)
     if not user:
         raise HTTPException(status_code=401, detail="请先登录知识库")
+    require_database_ready()
     return user
 
 
@@ -397,6 +466,7 @@ def terms(text: str) -> set[str]:
 
 
 def perform_search(query: str, top_k: int = 5) -> list[dict[str, Any]]:
+    require_database_ready()
     query = (query or "").strip()
     if not query:
         return []
@@ -475,12 +545,23 @@ def logout():
 
 @app.get("/health")
 def health():
+    # Keep the health endpoint responsive while the database initializes/retries.
+    base = {
+        "ok": True,
+        "service": "robot-competition-knowledge-base",
+        "version": APP_VERSION,
+        "database": "postgresql" if DATABASE_URL else "sqlite",
+        "database_ready": DATABASE_READY,
+        "object_storage": OBJECT_STORAGE_PROVIDER if OBJECT_STORAGE_ENABLED else "database_blob",
+    }
+    if not DATABASE_READY:
+        base["database_status"] = "unavailable" if DATABASE_INIT_ERROR else "initializing"
+        return base
     with SessionLocal() as db:
         count = db.scalar(select(func.count()).select_from(KnowledgeDocument)) or 0
         chunks = db.scalar(select(func.count()).select_from(KnowledgeChunk)) or 0
-    return {"ok": True, "service": "robot-competition-knowledge-base", "version": APP_VERSION,
-            "documents": count, "chunks": chunks, "database": "postgresql" if DATABASE_URL else "sqlite",
-            "object_storage": OBJECT_STORAGE_PROVIDER if OBJECT_STORAGE_ENABLED else "database_blob"}
+    base.update({"documents": count, "chunks": chunks, "database_status": "ready"})
+    return base
 
 
 @app.get("/api/v1/kb/documents")
