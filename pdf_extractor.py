@@ -102,6 +102,59 @@ def _ocr_pdf(raw: bytes) -> tuple[str, str]:
         return "", "OCR失败"
 
 
+def _rapidocr_pdf(raw: bytes) -> tuple[str, str]:
+    """Portable Chinese/English OCR fallback that does not require a system Tesseract binary."""
+    try:
+        import fitz
+        import numpy as np
+        from PIL import Image
+        from rapidocr import RapidOCR
+    except Exception as exc:
+        logger.warning("RapidOCR dependencies are unavailable: %s", type(exc).__name__)
+        return "", "OCR未启用"
+
+    try:
+        configured_limit = int(os.getenv("MAX_PDF_OCR_PAGES", "40"))
+        page_limit = max(1, min(configured_limit, 100))
+        engine = RapidOCR()
+        page_texts: list[str] = []
+        with fitz.open(stream=raw, filetype="pdf") as pdf:
+            page_count = len(pdf)
+            for page_index in range(min(page_count, page_limit)):
+                page = pdf.load_page(page_index)
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
+                with Image.open(io.BytesIO(pixmap.tobytes("png"))) as image:
+                    image_array = np.asarray(image.convert("RGB"))
+                result = engine(image_array)
+                texts = getattr(result, "txts", None)
+                if texts is None and isinstance(result, dict):
+                    texts = result.get("txts")
+                # Compatibility with older RapidOCR versions returning (boxes, text, scores).
+                if texts is None and isinstance(result, (tuple, list)) and result:
+                    first = result[0]
+                    if isinstance(first, list):
+                        texts = [
+                            item[1] for item in first
+                            if isinstance(item, (tuple, list)) and len(item) >= 2
+                        ]
+                if texts:
+                    page_text = "\n".join(str(item).strip() for item in texts if str(item).strip())
+                    if page_text:
+                        page_texts.append(f"第{page_index + 1}页：\n{page_text}")
+
+        result_text = "\n\n".join(page_texts).strip()
+        if page_count > page_limit:
+            logger.warning(
+                "PDF has %s pages; RapidOCR processed only the first %s pages.",
+                page_count,
+                page_limit,
+            )
+        return result_text, "RapidOCR识别" if result_text else "OCR未识别到文字"
+    except Exception as exc:
+        logger.warning("RapidOCR failed: %s", type(exc).__name__, exc_info=True)
+        return "", "OCR失败"
+
+
 def extract_pdf_text(raw: bytes) -> tuple[str, str]:
     """
     Prefer reliable embedded text; compare pypdf and PyMuPDF extraction.
@@ -140,9 +193,15 @@ def extract_pdf_text(raw: bytes) -> tuple[str, str]:
         return best_reliable[1], "已入库"
 
     ocr_text, ocr_reason = _ocr_pdf(raw)
+    if not ocr_text.strip():
+        # Tesseract may be absent on native Render runtimes; try the portable OCR engine.
+        rapid_text, rapid_reason = _rapidocr_pdf(raw)
+        if rapid_text.strip():
+            ocr_text, ocr_reason = rapid_text, rapid_reason
+
     if ocr_text.strip() and not pdf_text_is_suspicious(ocr_text):
-        if ocr_reason == "OCR识别":
-            logger.info("PDF text recovered with OCR.")
+        if ocr_reason in {"OCR识别", "RapidOCR识别"}:
+            logger.info("PDF text recovered with %s.", ocr_reason)
             return ocr_text, "已入库（OCR识别）"
 
     if best_reliable:
