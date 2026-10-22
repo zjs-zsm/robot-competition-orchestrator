@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import gc
 import io
 import logging
 import os
 import re
+import threading
 
 logger = logging.getLogger("robot_competition_knowledge_base.pdf")
+
+# One small OCR engine per process; serialize scanned-PDF work to avoid duplicate models
+# exhausting the memory limit when two reindex/upload requests arrive together.
+_RAPIDOCR_ENGINE = None
+_RAPIDOCR_LOCK = threading.Lock()
 
 
 def pdf_text_is_suspicious(text: str) -> bool:
@@ -102,13 +109,34 @@ def _ocr_pdf(raw: bytes) -> tuple[str, str]:
         return "", "OCR失败"
 
 
+def _get_rapidocr_engine():
+    """Create one memory-conscious OCR engine and reuse it across PDF requests."""
+    global _RAPIDOCR_ENGINE
+    if _RAPIDOCR_ENGINE is None:
+        from rapidocr import RapidOCR
+        from rapidocr.utils.typings import ModelType
+
+        _RAPIDOCR_ENGINE = RapidOCR(
+            params={
+                # Tiny PP-OCRv6 models plus no angle classifier reduce peak RAM on
+                # Render's 512 MiB instance while retaining Chinese/English OCR.
+                "Global.use_cls": False,
+                "Global.max_side_len": 1600,
+                "Det.model_type": ModelType.TINY,
+                "Rec.model_type": ModelType.TINY,
+                "EngineConfig.onnxruntime.intra_op_num_threads": 1,
+                "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+            }
+        )
+    return _RAPIDOCR_ENGINE
+
+
 def _rapidocr_pdf(raw: bytes) -> tuple[str, str]:
-    """Portable Chinese/English OCR fallback that does not require a system Tesseract binary."""
+    """Memory-bounded Chinese/English OCR fallback without a system Tesseract binary."""
     try:
         import fitz
         import numpy as np
         from PIL import Image
-        from rapidocr import RapidOCR
     except Exception as exc:
         logger.warning("RapidOCR dependencies are unavailable: %s", type(exc).__name__)
         return "", "OCR未启用"
@@ -116,44 +144,56 @@ def _rapidocr_pdf(raw: bytes) -> tuple[str, str]:
     try:
         configured_limit = int(os.getenv("MAX_PDF_OCR_PAGES", "40"))
         page_limit = max(1, min(configured_limit, 100))
-        engine = RapidOCR()
         page_texts: list[str] = []
-        with fitz.open(stream=raw, filetype="pdf") as pdf:
-            page_count = len(pdf)
-            for page_index in range(min(page_count, page_limit)):
-                page = pdf.load_page(page_index)
-                pixmap = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
-                with Image.open(io.BytesIO(pixmap.tobytes("png"))) as image:
-                    image_array = np.asarray(image.convert("RGB"))
-                result = engine(image_array)
-                texts = getattr(result, "txts", None)
-                if texts is None and isinstance(result, dict):
-                    texts = result.get("txts")
-                # Compatibility with older RapidOCR versions returning (boxes, text, scores).
-                if texts is None and isinstance(result, (tuple, list)) and result:
-                    first = result[0]
-                    if isinstance(first, list):
-                        texts = [
-                            item[1] for item in first
-                            if isinstance(item, (tuple, list)) and len(item) >= 2
-                        ]
-                if texts:
-                    page_text = "\n".join(str(item).strip() for item in texts if str(item).strip())
-                    if page_text:
-                        page_texts.append(f"第{page_index + 1}页：\n{page_text}")
+
+        # The lock covers model creation and the full document. Without it, concurrent
+        # requests can each allocate their own ONNX sessions and kill the service.
+        with _RAPIDOCR_LOCK:
+            engine = _get_rapidocr_engine()
+            with fitz.open(stream=raw, filetype="pdf") as pdf:
+                page_count = len(pdf)
+                for page_index in range(min(page_count, page_limit)):
+                    page = pdf.load_page(page_index)
+                    # 1.5x is sufficient for the detector's bounded input and uses less RAM.
+                    pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+                    with Image.open(io.BytesIO(pixmap.tobytes("png"))) as image:
+                        image_array = np.asarray(image.convert("RGB"))
+                    result = engine(image_array)
+                    texts = getattr(result, "txts", None)
+                    if texts is None and isinstance(result, dict):
+                        texts = result.get("txts")
+                    # Compatibility with older RapidOCR versions returning
+                    # (boxes, text, scores).
+                    if texts is None and isinstance(result, (tuple, list)) and result:
+                        first = result[0]
+                        if isinstance(first, list):
+                            texts = [
+                                item[1] for item in first
+                                if isinstance(item, (tuple, list)) and len(item) >= 2
+                            ]
+                    if texts:
+                        page_text = "\n".join(
+                            str(item).strip() for item in texts if str(item).strip()
+                        )
+                        if page_text:
+                            page_texts.append(f"第{page_index + 1}页：\n{page_text}")
+
+                    # Release page buffers before rendering the next page.
+                    del result, image_array, pixmap
+                    gc.collect()
+
+                if page_count > page_limit:
+                    logger.warning(
+                        "PDF has %s pages; RapidOCR processed only the first %s pages.",
+                        page_count,
+                        page_limit,
+                    )
 
         result_text = "\n\n".join(page_texts).strip()
-        if page_count > page_limit:
-            logger.warning(
-                "PDF has %s pages; RapidOCR processed only the first %s pages.",
-                page_count,
-                page_limit,
-            )
         return result_text, "RapidOCR识别" if result_text else "OCR未识别到文字"
     except Exception as exc:
         logger.warning("RapidOCR failed: %s", type(exc).__name__, exc_info=True)
         return "", "OCR失败"
-
 
 def extract_pdf_text(raw: bytes) -> tuple[str, str]:
     """
