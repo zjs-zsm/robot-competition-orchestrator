@@ -470,7 +470,7 @@ def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict
         # Render free services may be waking from idle. Retry transient gateway,
         # timeout and connection errors rather than immediately falling back to samples.
         retryable_statuses = {408, 429, 500, 502, 503, 504}
-        for attempt in range(1, 5):
+        for attempt in range(1, 7):
             req = urllib.request.Request(
                 KNOWLEDGE_API_URL,
                 data=body,
@@ -505,7 +505,7 @@ def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict
                     {"status": exc.code, "attempt": attempt},
                     flush=True,
                 )
-                if exc.code not in retryable_statuses or attempt == 4:
+                if exc.code not in retryable_statuses or attempt == 6:
                     break
             except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
                 print(
@@ -513,7 +513,7 @@ def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict
                     {"type": type(exc).__name__, "attempt": attempt},
                     flush=True,
                 )
-                if attempt == 4:
+                if attempt == 6:
                     break
             except Exception as exc:
                 print(
@@ -523,8 +523,9 @@ def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict
                 )
                 break
 
-            # 2s, 4s, then 8s backoff before the next attempt.
-            time.sleep(2 ** attempt)
+            # Exponential backoff capped at 8s; allow enough time for a sleeping Render KB
+            # service to complete its ~20-25s cold start before giving up.
+            time.sleep(min(2 ** attempt, 8))
 
     # No usable records from the external API: sample cases are placeholders only.
     scored = []
