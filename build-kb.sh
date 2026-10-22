@@ -11,12 +11,20 @@ if python -m pip install 'rapidocr>=3.10.0,<4.0' 'onnxruntime>=1.20.0,<2.0'; the
 try:
     import onnxruntime
     from rapidocr import RapidOCR
+    from rapidocr.utils.typings import ModelType
     import numpy as np
     from PIL import Image, ImageDraw
 
     # Exercise one inference call so missing ONNX Runtime/model errors are visible
     # during build rather than only after a user uploads a scanned PDF.
-    engine = RapidOCR()
+    engine = RapidOCR(params={
+        "Global.use_cls": False,
+        "Global.max_side_len": 1600,
+        "Det.model_type": ModelType.TINY,
+        "Rec.model_type": ModelType.TINY,
+        "EngineConfig.onnxruntime.intra_op_num_threads": 1,
+        "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+    })
     test_image = Image.new("RGB", (320, 96), "white")
     ImageDraw.Draw(test_image).text((12, 28), "OCR TEST 123", fill="black")
     engine(np.asarray(test_image))
