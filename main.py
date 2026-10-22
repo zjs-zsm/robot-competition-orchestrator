@@ -462,6 +462,29 @@ def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict
     )
 
     if KNOWLEDGE_API_URL:
+        # Ping the lightweight health endpoint first: a free Render KB service may be asleep.
+        # Never log the endpoint or API key; only log readiness fields.
+        try:
+            parsed_url = urllib.parse.urlsplit(KNOWLEDGE_API_URL)
+            health_url = urllib.parse.urlunsplit((parsed_url.scheme, parsed_url.netloc, "/health", "", ""))
+            health_req = urllib.request.Request(
+                health_url,
+                headers={"User-Agent": "RobotCompetitionAssistant/4.1"},
+                method="GET",
+            )
+            with urllib.request.urlopen(health_req, timeout=8) as health_resp:
+                health_data = json.loads(health_resp.read().decode("utf-8"))
+            print(
+                "KNOWLEDGE_API_HEALTH:",
+                {"ok": health_data.get("ok"), "database_ready": health_data.get("database_ready")},
+                flush=True,
+            )
+            if health_data.get("database_ready") is False:
+                time.sleep(2)
+        except Exception as exc:
+            print("KNOWLEDGE_API_HEALTH_ERROR:", {"type": type(exc).__name__}, flush=True)
+            time.sleep(2)
+
         body = json.dumps({"query": query, "top_k": top_k}, ensure_ascii=False).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if KNOWLEDGE_API_KEY:
@@ -1369,13 +1392,23 @@ def _generate_ai_visual(prompt: str, path: Path) -> bool:
     return _generic_image_api(prompt, path) or _pollinations_image(prompt, path)
 
 
-def generate_project_images(report: Dict[str, Any], session_key: str) -> Dict[str, str]:
+def generate_project_images(report: Dict[str, Any], session_key: str, fast_mode: bool = False) -> Dict[str, str]:
     digest = hashlib.sha1(f"{session_key}-{report.get('project_title','')}".encode("utf-8")).hexdigest()[:10]
     result: Dict[str, str] = {}
     ai_configured = bool(POLLINATIONS_API_KEY or IMAGE_API_URL)
 
     # 第1页：产品英雄图
     product_path = EXPORT_DIR / f"visual_product_{digest}.png"
+    if fast_mode:
+        # Chaoxing's workflow can time out while waiting for external image APIs.
+        # Fast export uses local illustrative images; the Word-native system/workflow diagrams remain editable.
+        _fallback_robot_illustration(report, product_path, scene=False)
+        scene_path = EXPORT_DIR / f"visual_scene_{digest}.png"
+        _fallback_robot_illustration(report, scene_path, scene=True)
+        result["product"] = str(product_path)
+        result["scene"] = str(scene_path)
+        return result
+
     product_prompt = _visual_prompt(report, "product")
     product_ok = _generate_ai_visual(product_prompt, product_path) if ai_configured else False
 
@@ -1836,8 +1869,8 @@ def _render_page(doc: Document, report: Dict[str, Any], page_no: int, images: Di
 
     _add_revision_notes(doc, content)
 
-def export_report_to_word(report_json: Dict[str, Any], session_key: str) -> Dict[str, str]:
-    images = generate_project_images(report_json, session_key)
+def export_report_to_word(report_json: Dict[str, Any], session_key: str, fast_mode: bool = False) -> Dict[str, str]:
+    images = generate_project_images(report_json, session_key, fast_mode=fast_mode)
     doc = _prepare_document()
     _render_cover(doc, report_json, images)
 
@@ -1858,7 +1891,7 @@ def export_report_to_word(report_json: Dict[str, Any], session_key: str) -> Dict
         "filename": filename,
         "file_path": str(path),
         "download_url": f"{PUBLIC_BASE_URL}/api/v1/robot-competition/download/{filename}",
-        "visual_mode": "ai_generated_strict" if (POLLINATIONS_API_KEY or IMAGE_API_URL) else "offline_fallback",
+        "visual_mode": "fast_local_illustrations_native_diagrams" if fast_mode else ("ai_generated_strict" if (POLLINATIONS_API_KEY or IMAGE_API_URL) else "offline_fallback"),
     }
 
 # ============================================================
@@ -2118,17 +2151,53 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
         session["report_json"] = report_json
         session["report_revision"] = int(session.get("report_revision", 0)) + 1
         session["stage"] = "report_json_ready"
+        session.pop("word_file", None)
         save_session(session_key, session)
 
-        return response(
-            success=True,
-            stage="report_json_ready",
-            intent=intent,
-            message=format_report_summary(report_json),
-            payload_json=json.dumps(report_json, ensure_ascii=False, indent=2),
-            data={"report_json": report_json, "revision": session["report_revision"]},
-            suggested_actions=["下载报告", "查看报告结构数据", "修改第3页系统框图", "优化第5页流程图"],
-        )
+        # Create the Word file in the same request as report generation.
+        # This avoids relying on a separate Chaoxing "download report" node to fire.
+        try:
+            export_info = export_report_to_word(report_json, session_key, fast_mode=True)
+            session["word_file"] = export_info
+            session["stage"] = "word_ready"
+            save_session(session_key, session)
+            download_url = export_info["download_url"]
+            report_message = (
+                format_report_summary(report_json)
+                + "\\n\\nWord报告已自动生成（7页，含系统框图、项目流程图等可编辑图表）。"
+                + "\\n\\n**下载链接：**\\n"
+                + "[点击下载 Word 报告](" + download_url + ")"
+                + "\\n\\n如果链接无法点击，请复制以下地址：\\n"
+                + download_url
+            )
+            return response(
+                success=True,
+                stage="word_ready",
+                intent=intent,
+                message=report_message,
+                payload_json=json.dumps(report_json, ensure_ascii=False, indent=2),
+                download_url=download_url,
+                data={"report_json": report_json, "word_file": export_info, "revision": session["report_revision"]},
+                files=[{"name": export_info["filename"], "url": download_url, "type": "docx"}],
+                suggested_actions=["下载报告", "查看报告结构数据", "修改指定页面后重新导出"],
+            )
+        except Exception as exc:
+            print("DEBUG_AUTO_WORD_ERROR:", repr(exc), flush=True)
+            session["stage"] = "report_json_ready"
+            save_session(session_key, session)
+            return response(
+                success=True,
+                stage="report_json_ready",
+                intent=intent,
+                message=(
+                    format_report_summary(report_json)
+                    + "\\n\\nWord文件暂未生成（" + type(exc).__name__ + "）。"
+                    + "请继续输入“下载报告”重试。"
+                ),
+                payload_json=json.dumps(report_json, ensure_ascii=False, indent=2),
+                data={"report_json": report_json, "revision": session["report_revision"], "word_export_error": type(exc).__name__},
+                suggested_actions=["下载报告", "查看报告结构数据"],
+            )
 
     if intent == "view_report_json":
         report_json = session.get("report_json")
@@ -2220,7 +2289,7 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             )
 
         try:
-            export_info = export_report_to_word(report_json, session_key)
+            export_info = export_report_to_word(report_json, session_key, fast_mode=True)
             print("DEBUG_WORD_SUCCESS:", export_info, flush=True)
         except Exception as exc:
             print("DEBUG_WORD_ERROR:", repr(exc), flush=True)
@@ -2244,7 +2313,9 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             message=(
                 "Word报告已经生成完成。\n\n"
                 "文档已按7页竞赛报告结构排版：第3页强制包含系统框图，第5页强制包含项目工作流程图，并配套AI项目效果图、软硬件功能框图、差异化对比与落地路线图。\n\n"
-                "请点击下方链接下载 .docx 文件："
+                "请点击以下链接下载 .docx 文件：\\n\\n"
+                + "[点击下载 Word 报告](" + export_info["download_url"] + ")"
+                + "\\n\\n如果链接无法点击，请复制：\\n" + export_info["download_url"]
             ),
             payload_json=json.dumps(report_json, ensure_ascii=False, indent=2),
             download_url=export_info["download_url"],
@@ -2307,7 +2378,13 @@ def chat(req: ChatRequest) -> ChatResponse:
 def download(filename: str):
     safe = Path(filename).name
     file_path = EXPORT_DIR / safe
-    if not file_path.exists() or not file_path.is_file():
+    exists = file_path.exists() and file_path.is_file()
+    print(
+        "DEBUG_DOWNLOAD_REQUEST:",
+        {"filename": safe, "exists": exists, "size_bytes": file_path.stat().st_size if exists else 0},
+        flush=True,
+    )
+    if not exists:
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(
         path=str(file_path),
