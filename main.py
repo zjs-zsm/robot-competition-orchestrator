@@ -12,6 +12,7 @@ import random
 import re
 import sqlite3
 import textwrap
+import time
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -461,25 +462,71 @@ def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict
     )
 
     if KNOWLEDGE_API_URL:
-        try:
-            body = json.dumps({"query": query, "top_k": top_k}, ensure_ascii=False).encode("utf-8")
-            headers = {"Content-Type": "application/json"}
-            if KNOWLEDGE_API_KEY:
-                headers["Authorization"] = f"Bearer {KNOWLEDGE_API_KEY}"
-            req = urllib.request.Request(KNOWLEDGE_API_URL, data=body, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            cases = data.get("cases") or data.get("results") or []
-            return {
-                "knowledge_base_used": True,
-                "similar_award_cases": cases[:top_k],
-                "knowledge_sources": data.get("sources", []),
-                "source_type": "external_knowledge_base",
-            }
-        except Exception as exc:
-            print("KNOWLEDGE_API_ERROR:", repr(exc), flush=True)
+        body = json.dumps({"query": query, "top_k": top_k}, ensure_ascii=False).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if KNOWLEDGE_API_KEY:
+            headers["Authorization"] = f"Bearer {KNOWLEDGE_API_KEY}"
 
-    # 无老师资料时，样例库仅作占位，不冒充真实获奖数据
+        # Render free services may be waking from idle. Retry transient gateway,
+        # timeout and connection errors rather than immediately falling back to samples.
+        retryable_statuses = {408, 429, 500, 502, 503, 504}
+        for attempt in range(1, 5):
+            req = urllib.request.Request(
+                KNOWLEDGE_API_URL,
+                data=body,
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+
+                cases = data.get("cases") or data.get("results") or []
+                if cases:
+                    return {
+                        "knowledge_base_used": True,
+                        "similar_award_cases": cases[:top_k],
+                        "knowledge_sources": data.get("sources", []),
+                        "source_type": "external_knowledge_base",
+                    }
+
+                # A reachable API with no matching records is not evidence of real
+                # award cases; preserve the existing honest sample-library fallback.
+                print(
+                    "KNOWLEDGE_API_EMPTY_RESULT:",
+                    {"query_length": len(query), "attempt": attempt},
+                    flush=True,
+                )
+                break
+
+            except urllib.error.HTTPError as exc:
+                print(
+                    "KNOWLEDGE_API_HTTP_ERROR:",
+                    {"status": exc.code, "attempt": attempt},
+                    flush=True,
+                )
+                if exc.code not in retryable_statuses or attempt == 4:
+                    break
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+                print(
+                    "KNOWLEDGE_API_CONNECTION_ERROR:",
+                    {"type": type(exc).__name__, "attempt": attempt},
+                    flush=True,
+                )
+                if attempt == 4:
+                    break
+            except Exception as exc:
+                print(
+                    "KNOWLEDGE_API_ERROR:",
+                    {"type": type(exc).__name__, "attempt": attempt},
+                    flush=True,
+                )
+                break
+
+            # 2s, 4s, then 8s backoff before the next attempt.
+            time.sleep(2 ** attempt)
+
+    # No usable records from the external API: sample cases are placeholders only.
     scored = []
     kws = set(fields.get("keywords", []))
     for case in REFERENCE_CASES:
@@ -494,7 +541,6 @@ def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict
         "knowledge_sources": [],
         "source_type": "sample_case_library",
     }
-
 
 # ============================================================
 # 动态候选题目
