@@ -230,10 +230,10 @@ def build_session_key(req: ChatRequest) -> str:
     session_id = (req.session_id or "").strip()
 
     placeholder_users = {
-        "", "anonymous", "current_user", "user_456", "chaoxing-test-user"
+        "", "anonymous", "current_user", "default_user", "user_456", "chaoxing-test-user"
     }
     placeholder_sessions = {
-        "", "default", "current_session", "current_session_123", "chaoxing-test-001"
+        "", "default", "default_session", "current_session", "current_session_123", "chaoxing-test-001"
     }
 
     if user_id in placeholder_users:
@@ -2028,6 +2028,7 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
 
     print("DEBUG_MESSAGE:", user_message, "INTENT:", intent, flush=True)
     print("DEBUG_SESSION:", session_key, "SESSION_KEYS:", list(session.keys()), flush=True)
+    print("DEBUG_SESSION_STATE:", {"session_key": session_key, "stage": session.get("stage"), "has_report_json": bool(session.get("report_json")), "has_selected_title": bool(session.get("selected_title"))}, flush=True)
 
     if intent in {"create_project", "supplement_idea", "regenerate_titles"}:
         if intent == "create_project":
