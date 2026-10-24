@@ -31,7 +31,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from PIL import Image, ImageDraw, ImageFont
 
-APP_VERSION = "4.1.0"
+APP_VERSION = "4.1.1"
 
 app = FastAPI(
     title="Robot Competition Orchestrator",
@@ -1542,52 +1542,58 @@ def _set_cell_shading(cell, fill: str) -> None:
     tc_pr.append(shd)
 
 
-def _set_run_font(run, name: str = "Microsoft YaHei", size: float = 10.5, bold: bool = False) -> None:
+
+def _set_run_font(run, name: str = "SimSun", size: float = 12, bold: bool = False) -> None:
     run.font.name = name
     run._element.rPr.rFonts.set(qn("w:eastAsia"), name)
     run.font.size = Pt(size)
     run.bold = bold
 
-
 def _add_title(doc: Document, text: str, size: float = 22) -> None:
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_before = Pt(4)
+    p.paragraph_format.space_after = Pt(6)
+    p.paragraph_format.keep_with_next = True
     r = p.add_run(text)
-    _set_run_font(r, size=size, bold=True)
-
+    _set_run_font(r, name="SimHei", size=size, bold=True)
 
 def _add_heading(doc: Document, text: str, level: int = 1) -> None:
     p = doc.add_paragraph()
-    r = p.add_run(text)
-    _set_run_font(r, size=16 if level == 1 else 13, bold=True)
-    p.paragraph_format.space_before = Pt(6)
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    p.paragraph_format.first_line_indent = Pt(0)
+    p.paragraph_format.space_before = Pt(8 if level == 1 else 5)
     p.paragraph_format.space_after = Pt(3)
-
+    p.paragraph_format.keep_with_next = True
+    p.paragraph_format.keep_together = True
+    r = p.add_run(str(text).strip())
+    _set_run_font(r, name="SimHei", size=15 if level == 1 else 14, bold=True)
 
 def _add_paragraph(doc: Document, text: Any, bold_prefix: Optional[str] = None, first_line: bool = True) -> None:
     if text is None or str(text).strip() == "":
         return
+    clean_text = re.sub(r"[ \\t]{2,}", " ", str(text).strip())
     p = doc.add_paragraph()
-    p.paragraph_format.line_spacing = 1.28
-    p.paragraph_format.space_after = Pt(3)
-    if first_line:
-        p.paragraph_format.first_line_indent = Cm(0.74)
-    if bold_prefix and str(text).startswith(bold_prefix):
+    p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    p.paragraph_format.line_spacing = 1.25
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(0)
+    p.paragraph_format.first_line_indent = Pt(24) if first_line else Pt(0)
+    if bold_prefix and clean_text.startswith(bold_prefix):
         r1 = p.add_run(bold_prefix)
-        _set_run_font(r1, bold=True)
-        r2 = p.add_run(str(text)[len(bold_prefix):])
-        _set_run_font(r2)
+        _set_run_font(r1, name="SimSun", size=12, bold=True)
+        r2 = p.add_run(clean_text[len(bold_prefix):])
+        _set_run_font(r2, name="SimSun", size=12)
     else:
-        r = p.add_run(str(text))
-        _set_run_font(r)
-
-
+        r = p.add_run(clean_text)
+        _set_run_font(r, name="SimSun", size=12)
 def _add_paragraphs(doc: Document, items: Any, limit: int = 10) -> None:
     if isinstance(items, list):
         for item in items[:limit]:
             _add_paragraph(doc, item)
     elif items:
         _add_paragraph(doc, items)
+
 
 
 def _add_bullets(doc: Document, items: Any, limit: int = 10) -> None:
@@ -1597,38 +1603,47 @@ def _add_bullets(doc: Document, items: Any, limit: int = 10) -> None:
         return
     for item in items[:limit]:
         p = doc.add_paragraph(style=None)
+        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         p.paragraph_format.left_indent = Cm(0.55)
         p.paragraph_format.first_line_indent = Cm(-0.3)
-        p.paragraph_format.line_spacing = 1.2
-        p.paragraph_format.space_after = Pt(2)
+        p.paragraph_format.line_spacing = 1.25
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0)
         if isinstance(item, dict):
             name = item.get("name") or item.get("title") or item.get("dimension") or item.get("function") or ""
             desc = item.get("description") or item.get("implementation") or item.get("ours") or item.get("feedback") or ""
             value = f"• {name}：{desc}" if desc else f"• {name}"
         else:
-            value = f"• {item}"
+            value = f"• {str(item).strip()}"
         r = p.add_run(value)
-        _set_run_font(r, size=10.2)
-
+        _set_run_font(r, name="SimSun", size=12)
 
 def _add_image(doc: Document, path: Optional[str], caption: str, width_cm: float = 15.5) -> None:
     if not path or not Path(path).exists():
         return
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_before = Pt(6)
+    p.paragraph_format.space_after = Pt(0)
+    p.paragraph_format.keep_with_next = True
     r = p.add_run()
     try:
+        # Set width only: Word preserves the original aspect ratio and will not stretch the image.
         r.add_picture(path, width=Cm(width_cm))
     except Exception as exc:
         print("WORD_IMAGE_INSERT_ERROR:", repr(exc), flush=True)
         return
-    c = doc.add_paragraph()
-    c.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    c.paragraph_format.space_after = Pt(3)
-    rr = c.add_run(caption)
-    _set_run_font(rr, size=9)
+    _add_figure_caption(doc, caption)
 
 
+def _add_figure_caption(doc: Document, text: str) -> None:
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(8)
+    p.paragraph_format.line_spacing = 1.0
+    r = p.add_run(str(text).strip())
+    _set_run_font(r, name="SimSun", size=14)
 def _style_table(table, header_fill: str = "DCE6F1", body_fill: Optional[str] = None) -> None:
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     table.style = "Table Grid"
@@ -1740,8 +1755,9 @@ def _diagram_box(doc: Document, title: str, items: List[str], fill: str = "EAF2F
     p.paragraph_format.space_after = Pt(0)
 
 
+
 def _add_system_block_diagram(doc: Document, diagram: Dict[str, Any]) -> None:
-    """报告必备系统框图：单表紧凑版，确保7页物理页数。"""
+    """报告必备系统框图：Word原生可编辑，附规范图注。"""
     _add_heading(doc, "系统框图（必备）", 2)
     stages = [
         ("输入/场景层", diagram.get("inputs", []), "EAF2F8"),
@@ -1756,14 +1772,10 @@ def _add_system_block_diagram(doc: Document, diagram: Dict[str, Any]) -> None:
         cell = table.cell(i, 0)
         _set_cell_shading(cell, fill)
         body = " / ".join([str(x) for x in items if str(x).strip()][:5])
-        arrow = " ↓" if i < len(stages)-1 else ""
+        arrow = " ↓" if i < len(stages) - 1 else ""
         _set_cell_text(cell, f"{title}：{body}{arrow}", size=8.9, bold=True)
     _style_table(table, header_fill="D9EAF7")
-    cap = doc.add_paragraph()
-    cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    cap.paragraph_format.space_after = Pt(1)
-    rr = cap.add_run("图3  项目系统总体框图")
-    _set_run_font(rr, size=8.5)
+    _add_figure_caption(doc, "图3  项目系统总体框图")
 
 def _add_hw_sw_block_diagram(doc: Document, diagram: Dict[str, Any]) -> None:
     _add_heading(doc, "软硬件功能框图", 2)
@@ -1775,16 +1787,18 @@ def _add_hw_sw_block_diagram(doc: Document, diagram: Dict[str, Any]) -> None:
         _set_cell_shading(table.cell(0, i), fills[i])
         _set_cell_text(table.cell(0, i), h, size=10, bold=True)
         vals = diagram.get(keys[i], []) or []
-        _set_cell_text(table.cell(1, i), "\n↓\n".join([str(x) for x in vals[:5]]), size=9.3)
+        _set_cell_text(table.cell(1, i), "\\n↓\\n".join([str(x) for x in vals[:5]]), size=9.3)
     _style_table(table, header_fill="D9EAF7")
+    _add_figure_caption(doc, "图4  项目软硬件功能框图")
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(4)
     r = p.add_run("输入/感知 → 主控决策 → 执行输出，运行状态再回传形成闭环")
-    _set_run_font(r, size=9.3, bold=True)
-
+    _set_run_font(r, name="SimSun", size=10.5, bold=False)
 
 def _add_project_workflow_diagram(doc: Document, steps: List[str]) -> None:
-    """项目流程图：动态步骤，Word 原生可编辑。"""
+    """项目流程图：动态步骤，Word原生可编辑并附规范图注。"""
     _add_heading(doc, "项目工作流程图（必备）", 2)
     steps = [str(s) for s in steps if str(s).strip()][:8]
     if not steps:
@@ -1798,12 +1812,7 @@ def _add_project_workflow_diagram(doc: Document, steps: List[str]) -> None:
         _set_cell_text(c, step, size=8.5, bold=True)
         if i < len(steps) - 1:
             _set_cell_text(table.cell(0, i * 2 + 1), "→", size=14, bold=True)
-    cap = doc.add_paragraph()
-    cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    rr = cap.add_run("图4  项目运行与任务闭环流程")
-    _set_run_font(rr, size=9)
-
-
+    _add_figure_caption(doc, "图5  项目运行与任务闭环流程")
 def _add_landing_roadmap(doc: Document, steps: List[str]) -> None:
     _add_heading(doc, "项目落地路线图", 2)
     steps = [str(s) for s in steps if str(s).strip()][:6]
@@ -1825,29 +1834,92 @@ def _add_revision_notes(doc: Document, content: Dict[str, Any]) -> None:
     _add_heading(doc, "用户定制补充", 2)
     _add_bullets(doc, notes, 8)
 
+
+def _set_page_layout(section) -> None:
+    # A4 portrait with uniform 2 cm margins.
+    section.page_width = Cm(21.0)
+    section.page_height = Cm(29.7)
+    section.top_margin = Cm(2)
+    section.bottom_margin = Cm(2)
+    section.left_margin = Cm(2)
+    section.right_margin = Cm(2)
+
+
+def _add_page_number(section) -> None:
+    # Cover remains unnumbered; the body section starts at page 1.
+    section.footer.is_linked_to_previous = False
+    footer = section.footer
+    p = footer.paragraphs[0]
+    p.text = ""
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(0)
+    p.paragraph_format.line_spacing = 1.0
+
+    begin_run = p.add_run()
+    _set_run_font(begin_run, name="SimSun", size=10.5)
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    begin_run._r.append(begin)
+
+    instruction_run = p.add_run()
+    _set_run_font(instruction_run, name="SimSun", size=10.5)
+    instruction = OxmlElement("w:instrText")
+    instruction.set(qn("xml:space"), "preserve")
+    instruction.text = " PAGE "
+    instruction_run._r.append(instruction)
+
+    separate_run = p.add_run()
+    _set_run_font(separate_run, name="SimSun", size=10.5)
+    separate = OxmlElement("w:fldChar")
+    separate.set(qn("w:fldCharType"), "separate")
+    separate_run._r.append(separate)
+
+    cached_value = p.add_run("1")
+    _set_run_font(cached_value, name="SimSun", size=10.5)
+
+    end_run = p.add_run()
+    _set_run_font(end_run, name="SimSun", size=10.5)
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    end_run._r.append(end)
+
+    sect_pr = section._sectPr
+    page_num = sect_pr.find(qn("w:pgNumType"))
+    if page_num is None:
+        page_num = OxmlElement("w:pgNumType")
+        cols = sect_pr.find(qn("w:cols"))
+        if cols is not None:
+            sect_pr.insert(sect_pr.index(cols), page_num)
+        else:
+            sect_pr.append(page_num)
+    page_num.set(qn("w:start"), "1")
+
+
 def _prepare_document() -> Document:
     doc = Document()
     section = doc.sections[0]
-    section.top_margin = Cm(1.45)
-    section.bottom_margin = Cm(1.35)
-    section.left_margin = Cm(1.55)
-    section.right_margin = Cm(1.55)
+    _set_page_layout(section)
 
     styles = doc.styles
     normal = styles["Normal"]
-    normal.font.name = "Microsoft YaHei"
-    normal._element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
-    normal.font.size = Pt(10.3)
+    normal.font.name = "SimSun"
+    normal._element.rPr.rFonts.set(qn("w:eastAsia"), "SimSun")
+    normal.font.size = Pt(12)
+    normal.paragraph_format.line_spacing = 1.25
+    normal.paragraph_format.space_before = Pt(0)
+    normal.paragraph_format.space_after = Pt(0)
+    normal.paragraph_format.first_line_indent = Pt(0)
+    normal.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     return doc
-
-
 def _render_cover(doc: Document, report: Dict[str, Any], images: Dict[str, str]) -> None:
-    doc.add_paragraph("\n")
     _add_title(doc, report.get("project_title", "智能机器人竞赛项目"), 22)
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     r = p.add_run("智能机器人创意竞赛 · 项目设计报告")
-    _set_run_font(r, size=13)
+    _set_run_font(r, name="SimSun", size=13)
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(4)
     _add_image(doc, images.get("product"), "图1  项目产品概念效果图", 15.8)
 
     content = report.get("pages", {}).get("page_1", {}).get("content", {})
@@ -1957,7 +2029,13 @@ def export_report_to_word(report_json: Dict[str, Any], session_key: str, fast_mo
     _render_cover(doc, report_json, images)
 
     for page_no in range(2, 8):
-        doc.add_page_break()
+        if page_no == 2:
+            # Section break separates the unnumbered cover from consecutively numbered body pages.
+            body_section = doc.add_section(WD_SECTION.NEW_PAGE)
+            _set_page_layout(body_section)
+            _add_page_number(body_section)
+        else:
+            doc.add_page_break()
         _render_page(doc, report_json, page_no, images)
 
     digest = hashlib.sha1(
