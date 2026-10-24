@@ -1572,7 +1572,7 @@ def _add_heading(doc: Document, text: str, level: int = 1) -> None:
 def _add_paragraph(doc: Document, text: Any, bold_prefix: Optional[str] = None, first_line: bool = True) -> None:
     if text is None or str(text).strip() == "":
         return
-    clean_text = re.sub(r" {2,}", " ", str(text).replace("\\t", " ").strip())
+    clean_text = re.sub(r" {2,}", " ", str(text).replace(chr(9), " ").strip())
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     p.paragraph_format.line_spacing = 1.25
