@@ -468,8 +468,11 @@ def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict
         parsed_url = urllib.parse.urlsplit(KNOWLEDGE_API_URL)
         target_host = parsed_url.netloc
         target_path = parsed_url.path
+        health_url = urllib.parse.urlunsplit(
+            (parsed_url.scheme, parsed_url.netloc, "/health", "", "")
+        )
         headers = {
-            "User-Agent": "RobotCompetitionAssistant/4.3",
+            "User-Agent": "RobotCompetitionAssistant/4.4",
             "Content-Type": "application/json",
         }
         if KNOWLEDGE_API_KEY:
@@ -480,126 +483,195 @@ def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict
             ensure_ascii=False,
         ).encode("utf-8")
         retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
-        backoff_seconds = [3, 8, 15, 20]
 
         print(
             "KNOWLEDGE_API_TARGET:",
-            {"host": target_host, "path": target_path, "api_key_configured": bool(KNOWLEDGE_API_KEY)},
+            {
+                "host": target_host,
+                "path": target_path,
+                "api_key_configured": bool(KNOWLEDGE_API_KEY),
+            },
             flush=True,
         )
 
-        for attempt in range(1, len(backoff_seconds) + 2):
-            req = urllib.request.Request(
-                KNOWLEDGE_API_URL,
-                data=body,
-                headers=headers,
-                method="POST",
+        # The knowledge service is on Render's free tier and may be asleep.
+        # Probe its health endpoint first and space retries to avoid flooding
+        # Render's edge with POST requests while the service is starting.
+        healthy = False
+        health_backoff_seconds = [20, 25, 30]
+        for attempt in range(1, len(health_backoff_seconds) + 2):
+            health_req = urllib.request.Request(
+                health_url,
+                headers={"User-Agent": headers["User-Agent"]},
+                method="GET",
             )
             try:
-                # Direct search avoids an extra health request, which is especially
-                # important when the free Render knowledge service is waking up.
-                with urllib.request.urlopen(req, timeout=18) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
+                with urllib.request.urlopen(health_req, timeout=12) as health_resp:
+                    health_data = json.loads(health_resp.read().decode("utf-8"))
 
-                raw_results = data.get("cases") or data.get("results") or []
-                if not isinstance(raw_results, list):
-                    raw_results = []
-
-                results = []
-                for item in raw_results[:top_k]:
-                    if not isinstance(item, dict):
-                        continue
-                    normalized = dict(item)
-                    normalized["title"] = str(
-                        item.get("title") or item.get("source") or "知识库资料"
-                    )
-                    normalized["source"] = str(
-                        item.get("source") or item.get("title") or "知识库资料"
-                    )
-                    normalized["summary"] = str(
-                        item.get("summary") or item.get("content") or item.get("text") or ""
-                    )
-                    try:
-                        normalized["similarity"] = float(item.get("similarity", 0) or 0)
-                    except (TypeError, ValueError):
-                        normalized["similarity"] = 0.0
-                    results.append(normalized)
-
-                sources = data.get("sources") or list(
-                    dict.fromkeys(item["source"] for item in results)
-                )
-                if results:
+                if health_data.get("ok") and health_data.get("database_ready") is not False:
+                    healthy = True
                     print(
-                        "KNOWLEDGE_SEARCH_SUCCESS:",
+                        "KNOWLEDGE_API_HEALTH_OK:",
                         {
-                            "result_count": len(results),
-                            "source_count": len(sources),
-                            "query_length": len(query),
                             "host": target_host,
+                            "database_ready": health_data.get("database_ready"),
+                            "documents": health_data.get("documents"),
+                            "chunks": health_data.get("chunks"),
                             "attempt": attempt,
                         },
                         flush=True,
                     )
-                    return {
-                        "knowledge_base_connected": True,
-                        "knowledge_base_used": True,
-                        "similar_award_cases": results,
-                        "knowledge_sources": sources,
-                        "source_type": "external_knowledge_base",
-                    }
+                    break
 
                 print(
-                    "KNOWLEDGE_SEARCH_EMPTY:",
-                    {"query_length": len(query), "host": target_host, "attempt": attempt},
-                    flush=True,
-                )
-                return {
-                    "knowledge_base_connected": True,
-                    "knowledge_base_used": False,
-                    "similar_award_cases": [],
-                    "knowledge_sources": sources,
-                    "source_type": "external_knowledge_base_empty",
-                }
-
-            except urllib.error.HTTPError as exc:
-                retry_after = 0
-                try:
-                    retry_after = int(exc.headers.get("Retry-After", "0"))
-                except (TypeError, ValueError, AttributeError):
-                    retry_after = 0
-                print(
-                    "KNOWLEDGE_SEARCH_HTTP_ERROR:",
+                    "KNOWLEDGE_API_NOT_READY:",
                     {
-                        "status": exc.code,
                         "host": target_host,
-                        "path": target_path,
+                        "database_ready": health_data.get("database_ready"),
                         "attempt": attempt,
-                        "retry_after": retry_after or None,
                     },
                     flush=True,
                 )
-                if exc.code not in retryable_statuses or attempt >= len(backoff_seconds) + 1:
+            except urllib.error.HTTPError as exc:
+                print(
+                    "KNOWLEDGE_API_HEALTH_HTTP_ERROR:",
+                    {"status": exc.code, "host": target_host, "attempt": attempt},
+                    flush=True,
+                )
+                if exc.code not in retryable_statuses:
                     break
-                time.sleep(min(max(retry_after, backoff_seconds[attempt - 1]), 25))
             except Exception as exc:
                 print(
-                    "KNOWLEDGE_SEARCH_ERROR:",
-                    {
-                        "type": type(exc).__name__,
-                        "host": target_host,
-                        "path": target_path,
-                        "attempt": attempt,
-                    },
+                    "KNOWLEDGE_API_HEALTH_ERROR:",
+                    {"type": type(exc).__name__, "host": target_host, "attempt": attempt},
                     flush=True,
                 )
-                if attempt >= len(backoff_seconds) + 1:
-                    break
-                time.sleep(backoff_seconds[attempt - 1])
+
+            if attempt < len(health_backoff_seconds) + 1:
+                time.sleep(health_backoff_seconds[attempt - 1])
+
+        if healthy:
+            for attempt in range(1, 3):
+                req = urllib.request.Request(
+                    KNOWLEDGE_API_URL,
+                    data=body,
+                    headers=headers,
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=22) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+
+                    raw_results = data.get("cases") or data.get("results") or []
+                    if not isinstance(raw_results, list):
+                        raw_results = []
+
+                    results = []
+                    for item in raw_results[:top_k]:
+                        if not isinstance(item, dict):
+                            continue
+                        normalized = dict(item)
+                        normalized["title"] = str(
+                            item.get("title") or item.get("source") or "知识库资料"
+                        )
+                        normalized["source"] = str(
+                            item.get("source") or item.get("title") or "知识库资料"
+                        )
+                        normalized["summary"] = str(
+                            item.get("summary") or item.get("content") or item.get("text") or ""
+                        )
+                        try:
+                            normalized["similarity"] = float(item.get("similarity", 0) or 0)
+                        except (TypeError, ValueError):
+                            normalized["similarity"] = 0.0
+                        results.append(normalized)
+
+                    sources = data.get("sources") or list(
+                        dict.fromkeys(item["source"] for item in results)
+                    )
+                    if results:
+                        print(
+                            "KNOWLEDGE_SEARCH_SUCCESS:",
+                            {
+                                "result_count": len(results),
+                                "source_count": len(sources),
+                                "query_length": len(query),
+                                "host": target_host,
+                                "attempt": attempt,
+                            },
+                            flush=True,
+                        )
+                        return {
+                            "knowledge_base_connected": True,
+                            "knowledge_base_used": True,
+                            "knowledge_lookup_attempted": True,
+                            "knowledge_lookup_status": "success",
+                            "similar_award_cases": results,
+                            "knowledge_sources": sources,
+                            "source_type": "external_knowledge_base",
+                        }
+
+                    print(
+                        "KNOWLEDGE_SEARCH_EMPTY:",
+                        {"query_length": len(query), "host": target_host, "attempt": attempt},
+                        flush=True,
+                    )
+                    return {
+                        "knowledge_base_connected": True,
+                        "knowledge_base_used": False,
+                        "knowledge_lookup_attempted": True,
+                        "knowledge_lookup_status": "empty",
+                        "similar_award_cases": [],
+                        "knowledge_sources": sources,
+                        "source_type": "external_knowledge_base_empty",
+                    }
+
+                except urllib.error.HTTPError as exc:
+                    retry_after = 0
+                    try:
+                        retry_after = int(exc.headers.get("Retry-After", "0"))
+                    except (TypeError, ValueError, AttributeError):
+                        retry_after = 0
+                    print(
+                        "KNOWLEDGE_SEARCH_HTTP_ERROR:",
+                        {
+                            "status": exc.code,
+                            "host": target_host,
+                            "path": target_path,
+                            "attempt": attempt,
+                            "retry_after": retry_after or None,
+                        },
+                        flush=True,
+                    )
+                    if exc.code not in retryable_statuses or attempt == 2:
+                        break
+                    time.sleep(min(max(retry_after, 20), 25))
+                except Exception as exc:
+                    print(
+                        "KNOWLEDGE_SEARCH_ERROR:",
+                        {
+                            "type": type(exc).__name__,
+                            "host": target_host,
+                            "path": target_path,
+                            "attempt": attempt,
+                        },
+                        flush=True,
+                    )
+                    if attempt == 2:
+                        break
+                    time.sleep(20)
+        else:
+            print(
+                "KNOWLEDGE_SEARCH_SKIPPED: health check never became ready",
+                {"host": target_host, "path": target_path},
+                flush=True,
+            )
     else:
         print("KNOWLEDGE_SEARCH_SKIPPED: KNOWLEDGE_API_URL is not configured", flush=True)
 
-    # Sample cases are only for demo continuity. They are never treated as real
-    # award records and never contribute to the competitiveness score.
+    # Sample cases are for interface continuity only; never use them as real
+    # award evidence or as a similarity penalty in competitiveness scoring.
     scored = []
     kws = set(fields.get("keywords", []))
     for case in REFERENCE_CASES:
@@ -611,6 +683,8 @@ def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict
     return {
         "knowledge_base_connected": False,
         "knowledge_base_used": False,
+        "knowledge_lookup_attempted": bool(KNOWLEDGE_API_URL),
+        "knowledge_lookup_status": "unavailable" if KNOWLEDGE_API_URL else "not_configured",
         "similar_award_cases": scored[:top_k],
         "knowledge_sources": [],
         "source_type": "sample_case_library",
@@ -819,7 +893,7 @@ def format_candidate_message(fields: Dict[str, Any], candidates: List[Dict[str, 
     else:
         lines += [
             "",
-            "知识库状态：本轮检索服务暂不可用。以下示例案例仅用于界面演示，不作为真实获奖证据，也不参与相似度扣分。",
+            "知识库状态：本轮未能连接检索服务。示例案例仅用于界面演示，不作为真实获奖证据，也不参与相似度扣分。",
         ]
 
     lines += ["", "请输入 1、2、3 选择题目；输入“重新生成”换一批；也可以继续补充你的创意要求。"]
@@ -2492,49 +2566,61 @@ def detect_page_number(message: str) -> Optional[int]:
     m = re.search(r"第([一二三四五六七])页", text)
     if m:
         return cn.get(m.group(1))
-    # 用户未写页码时，根据明确模块自动路由到对应页面
-    if contains_any(text, ["系统框图", "系统架构", "总体结构", "整体结构"]):
+
+    # Internal routing uses section names; users do not need to mention page numbers.
+    if contains_any(text, ["系统框图", "系统架构", "总体结构", "整体结构", "总体方案", "机械结构", "本体结构"]):
         return 3
-    if contains_any(text, ["软硬件", "硬件设计", "软件功能", "功能框图"]):
+    if contains_any(text, ["软硬件", "硬件设计", "软件功能", "功能框图", "硬件组成", "软件模块"]):
         return 4
-    if contains_any(text, ["项目流程图", "工作流程图", "技术路线", "流程图"]):
+    if contains_any(text, ["关键技术", "技术验证", "测试验证", "测试指标", "项目流程图", "工作流程图", "技术路线", "流程图", "风险控制"]):
         return 5
-    if contains_any(text, ["创新点", "差异化", "对比图"]):
+    if contains_any(text, ["创新点", "创新设计", "差异化", "传统方案", "对比图"]):
         return 6
-    if contains_any(text, ["行业前景", "应用前景", "落地路线", "落地路径"]):
+    if contains_any(text, ["行业前景", "应用前景", "落地路线", "落地路径", "商业化路径"]):
         return 7
-    if contains_any(text, ["设计背景", "用户需求", "用户痛点"]):
+    if contains_any(text, ["设计背景", "用户需求", "用户痛点", "应用需求"]):
         return 2
     if contains_any(text, ["封面", "项目题目", "标题"]):
         return 1
     return None
 
-
 def _looks_like_new_project_idea(message: str) -> bool:
-    """判断用户是在描述一个新的机器人创意，而不是在修改已生成报告。
-
-    规则故意偏保守：只要出现明显的“我要做/设计一个机器人”语义，就优先视为新项目。
-    这样即使同一会话里已经有旧 report_json，也不会把新创意误判成“修改报告”。
-    """
+    """Recognize new robot concepts even when they use a domain-specific vehicle name."""
     text = normalize_text(message)
     strong_starts = [
-        "我想设计一个", "我想做一个", "我想设计", "我想做", "我准备设计", "我准备做",
-        "设计一个", "做一个", "开发一个", "制作一个", "构思一个", "我的创意是", "机器人创意",
+        "我想设计一个", "我想设计一款", "我想设计一台", "我想设计",
+        "我想做一个", "我想做一款", "我想做一台", "我想做",
+        "我准备设计", "我准备做", "我准备开发",
+        "我要设计", "我要做", "我要开发", "我想开发", "我需要设计",
+        "设计一个", "设计一款", "设计一台", "做一个", "做一款",
+        "开发一个", "开发一款", "制作一个", "构思一个",
+        "我的创意是", "机器人创意",
     ]
-    robot_terms = ["机器人", "智能小车", "机械臂", "无人车", "巡检车", "陪护", "智能设备"]
+    robot_terms = [
+        "机器人", "智能小车", "巡逻小车", "巡逻车", "夜间巡逻", "巡逻机器人",
+        "智能巡逻", "校园巡逻", "安防巡逻", "巡检车", "巡检小车",
+        "无人车", "移动机器人", "小车", "机械臂", "智能设备",
+    ]
     if any(text.startswith(x) for x in strong_starts) and contains_any(text, robot_terms):
         return True
-    # 较长、包含功能描述的机器人需求，也按新创意处理
-    function_terms = ["可以", "用于", "主要", "实现", "能够", "自动", "识别", "检测", "提醒", "陪伴", "清理", "通知"]
-    return len(text) >= 28 and contains_any(text, robot_terms) and sum(w in text for w in function_terms) >= 2
 
+    # Long, function-oriented concepts are also treated as new projects.
+    function_terms = [
+        "可以", "用于", "主要", "实现", "能够", "自动", "识别", "检测",
+        "提醒", "陪伴", "清理", "通知", "巡查", "巡逻", "避障", "导航",
+    ]
+    return (
+        len(text) >= 28
+        and contains_any(text, robot_terms)
+        and sum(word in text for word in function_terms) >= 2
+    )
 
 def _is_explicit_revision_request(message: str, session: Dict[str, Any]) -> bool:
     """报告生成后才允许进入修改流程，而且必须有明确修改意图。"""
     if not session.get("report_json"):
         return False
     text = normalize_text(message)
-    revision_words = ["修改", "调整", "更改", "改成", "修改为", "补充", "增加", "新增", "删除", "删掉", "替换", "优化", "重写"]
+    revision_words = ["修改", "调整", "更改", "改成", "修改为", "补充", "增加", "新增", "删除", "删掉", "替换", "优化", "完善", "细化", "强化", "突出", "重写"]
     if not contains_any(text, revision_words):
         return False
     # 新项目描述永远优先，不误判成修改
@@ -2543,7 +2629,7 @@ def _is_explicit_revision_request(message: str, session: Dict[str, Any]) -> bool
     # 明确页码或报告模块时才算修改。
     return bool(
         detect_page_number(message)
-        or contains_any(text, ["系统框图", "流程图", "工作流程", "软硬件", "创新点", "差异化", "应用前景", "落地路线", "设计背景", "用户需求", "封面", "标题"])
+        or contains_any(text, ["系统框图", "系统架构", "总体结构", "流程图", "工作流程", "关键技术", "测试验证", "测试指标", "风险控制", "软硬件", "创新点", "差异化", "应用前景", "落地路线", "设计背景", "用户需求", "用户痛点", "封面", "标题"])
     )
 
 
@@ -2712,7 +2798,7 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
                 f"已确认最终竞赛题目：\n\n{selected['title']}\n\n"
                 f"竞赛竞争力评分：{selected['scores']['competitiveness_score']} / 100\n"
                 f"核心技术：{selected['core_tech']}\n\n"
-                "请输入“生成报告”，系统将围绕本项目生成固定7页结构、动态内容的竞赛报告。"
+                "请输入“生成报告”，系统将围绕本项目生成内容完整、章节清晰、图文紧凑的竞赛设计报告。"
             ),
             payload_json=json.dumps(payload, ensure_ascii=False, indent=2),
             data=payload,
@@ -2732,7 +2818,8 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
                 suggested_actions=["输入1", "输入2", "输入3"],
             )
 
-        if not knowledge.get("knowledge_base_connected") and not knowledge.get("knowledge_base_used"):
+        if (not knowledge.get("knowledge_base_connected") and not knowledge.get("knowledge_base_used")
+                and not knowledge.get("knowledge_lookup_attempted")):
             print("KNOWLEDGE_RETRY_ON_REPORT_GENERATION:", {"session_key": session_key}, flush=True)
             refreshed_knowledge = search_competition_knowledge(fields)
             if refreshed_knowledge.get("knowledge_base_connected"):
@@ -2873,17 +2960,23 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
         session["report_json"] = report_json
         session["report_revision"] = int(session.get("report_revision", 1)) + 1
         save_session(session_key, session)
+        section_label = {
+            1: "封面与项目题目", 2: "设计背景与用户需求",
+            3: "总体方案与系统结构", 4: "软硬件功能设计",
+            5: "关键技术与实现路径", 6: "创新设计与差异化",
+            7: "应用前景与落地路径",
+        }.get(page_no, "报告内容")
         return response(
             success=True,
             stage="report_json_ready",
             intent=intent,
             message=(
-                f"已完成第{page_no}页修改。当前版本：{session['report_revision']}。\n"
-                "你可以继续提出修改要求，或输入‘下载报告’重新导出最新版Word。"
+                f"已完成“{section_label}”章节的修改。当前版本：{session['report_revision']}。\n"
+                "你可以继续提出具体调整要求，或输入‘下载报告’重新导出最新版Word。"
             ),
             payload_json=json.dumps(report_json, ensure_ascii=False, indent=2),
             data={"report_json": report_json, "revision": session["report_revision"]},
-            suggested_actions=["下载报告", "继续修改第3页", "修改第5页流程图"],
+            suggested_actions=["下载报告", "完善系统架构", "补充测试验证", "突出创新点"],
         )
 
     if intent == "word_export_pending":
@@ -2920,7 +3013,7 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             stage="word_ready",
             intent=intent,
             message=(
-                "Word报告已经生成完成（7页，已嵌入"
+                "Word报告已经生成完成（已嵌入"
                 + str(export_info.get("embedded_images", 0))
                 + "张图片）。\n\n"
                 "对应题目：" + str(report_json.get("project_title", ""))
@@ -2931,7 +3024,7 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             download_url=export_info["download_url"],
             data={"word_file": export_info, "report_json": report_json},
             files=[{"name": export_info["filename"], "url": export_info["download_url"], "type": "docx"}],
-            suggested_actions=["下载报告", "修改指定页面后重新导出"],
+            suggested_actions=["下载报告", "按章节修改", "重新导出最新版"],
         )
 
     if intent == "post_report_chat":
@@ -2941,11 +3034,11 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             intent=intent,
             message=(
                 "当前报告已经生成。\n\n"
-                "如果你对报告不满意，请明确告诉我要修改哪一页或哪个模块，例如：\n"
-                "• 修改第3页，在系统框图中增加云端知识库模块\n"
-                "• 优化第5页项目工作流程图，增加测试验证环节\n"
-                "• 修改第6页，突出本项目相对传统方案的创新点\n\n"
-                "如果你要做一个全新的机器人项目，直接输入新的完整创意即可，我会自动重新生成3个候选题目。"
+                "如果需要调整，请直接告诉我要修改的章节或具体内容，例如：\n"
+                "• 完善总体方案与系统结构，在系统框图中增加云端知识库模块\n"
+                "• 补充关键技术的测试验证环节，明确测试指标和验收方法\n"
+                "• 突出创新设计与传统方案的差异，并补充对比依据\n\n"
+                "如果你要开启一个全新的机器人项目，请直接输入新的完整创意，我会重新分析需求并生成3个候选题目。"
             ),
             payload_json=json.dumps(session.get("report_json", {}), ensure_ascii=False, indent=2),
             data={"report_json": session.get("report_json", {}), "revision": session.get("report_revision", 1)},
@@ -2956,7 +3049,7 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
         success=False,
         stage="unknown",
         intent="unknown",
-        message="暂时无法识别该操作。你可以输入机器人创意、1/2/3、生成报告、修改指定页面或下载报告。",
+        message="暂时无法识别该操作。你可以输入新的机器人创意、1/2/3、生成报告、按章节修改或下载报告。",
     )
 
 
