@@ -339,6 +339,7 @@ SCENE_RULES = {
 }
 
 TARGET_RULES = {
+    "高校校园管理与安保人员": ["高校校园", "校园安保", "安保人员", "保安", "宿舍周边", "停车区域"],
     "老年人": ["老人", "老年", "独居", "空巢"],
     "儿童/学生": ["儿童", "孩子", "学生", "小朋友"],
     "残障/特殊人群": ["残障", "盲人", "视障", "行动不便", "听障"],
@@ -364,6 +365,9 @@ FUNCTION_RULES = {
     "植物养护": ["浇水", "植物", "多肉", "光照", "土壤", "施肥"],
     "垃圾分类与回收": ["垃圾分类", "回收", "垃圾"],
     "水质/环境检测": ["水质", "空气", "温湿度", "污染", "环境监测"],
+    "夜间安全巡逻与巡查": ["夜间巡逻", "巡逻", "安全巡查", "巡查"],
+    "人员与车辆识别": ["人员识别", "车辆识别", "人车检测", "人员检测", "车辆检测", "目标检测"],
+    "异常事件发现与告警": ["异常行为", "异常事件", "告警", "报警", "安全巡查"],
     "学习辅助": ["学习", "作业", "教学", "辅导", "监督"],
 }
 
@@ -376,6 +380,8 @@ TECH_RULES = {
     "物联网与远程通信": ["远程", "通知", "手机", "家属", "智能家居", "联网"],
     "边缘计算与本地决策": ["本地", "低延迟", "离线", "实时", "异常"],
     "智能规划与任务调度": ["自动", "规划", "调度", "定时", "任务"],
+    "夜间视觉与低照度目标检测": ["夜间", "低照度", "红外", "夜视", "人员检测", "车辆检测"],
+    "移动机器人自主巡逻与避障": ["巡逻", "巡查", "路径规划", "避障", "导航", "道路"],
 }
 
 
@@ -731,7 +737,10 @@ def _project_theme(fields: Dict[str, Any]) -> Tuple[str, str, str]:
     funcs = fields.get("core_functions", [])
     scene = fields.get("scenarios", ["应用场景"])[0]
     target = fields.get("target_groups", ["目标用户"])[0]
+    raw_idea = fields.get("raw_idea", "")
 
+    if contains_any(raw_idea, ["巡逻", "巡查", "校园安防", "夜间安全"]):
+        return "巡安", "校园夜间巡逻", "校园安防巡逻"
     if any("宠物" in f for f in funcs) or "宠物" in scene:
         return "宠护", "宠物照护", "智能照护"
     if any("植物" in f for f in funcs) or "园艺" in scene:
@@ -750,7 +759,8 @@ def _project_theme(fields: Dict[str, Any]) -> Tuple[str, str, str]:
 
 
 def local_generate_candidates(fields: Dict[str, Any], knowledge: Dict[str, Any]) -> List[Dict[str, Any]]:
-    seed = stable_seed(fields.get("raw_idea", ""))
+    raw_idea = fields.get("raw_idea", "")
+    seed = stable_seed(raw_idea)
     rng = random.Random(seed)
     prefix, domain, value = _project_theme(fields)
     target = fields.get("target_groups", ["目标用户"])[0]
@@ -760,48 +770,80 @@ def local_generate_candidates(fields: Dict[str, Any], knowledge: Dict[str, Any])
     function_text = "、".join(funcs[:3])
     tech_text = "、".join(tech[:3])
 
-    name_stems = [
-        ("星", "智"), ("卫", "慧"), ("伴", "灵"), ("盾", "安"),
-        ("擎", "智"), ("航", "慧"), ("联", "云"), ("芯", "睿"),
-    ]
-    rng.shuffle(name_stems)
-
-    names = [
-        f"{prefix}{name_stems[0][0]}",
-        f"{name_stems[1][1]}{domain[:2]}",
-        f"{prefix}{name_stems[2][1]}",
-    ]
-
-    candidates = [
-        {
-            "id": 1,
-            "title": f"“{names[0]}”——面向{target}的{domain}机器人",
-            "positioning": f"围绕{function_text}形成感知—决策—执行—反馈闭环，突出实际需求解决能力。",
-            "core_tech": tech_text,
-            "differentiator": "场景需求闭环",
-        },
-        {
-            "id": 2,
-            "title": f"“{names[1]}”——基于多模态感知的{scene}{value}机器人",
-            "positioning": f"以{tech_text}为核心，强调多源信息融合、主动判断与可靠执行。",
-            "core_tech": tech_text,
-            "differentiator": "多模态感知与主动决策",
-        },
-        {
-            "id": 3,
-            "title": f"“{names[2]}”——融合智能联动与自主服务的{domain}机器人",
-            "positioning": f"突出{function_text}之间的协同联动，强调展示性、可扩展性和工程落地。",
-            "core_tech": tech_text,
-            "differentiator": "模块协同与可扩展设计",
-        },
-    ]
+    # A domain-specific fallback prevents generic titles from losing the user's
+    # key concept when the optional LLM is disabled or unavailable.
+    if contains_any(raw_idea, ["巡逻", "巡查", "校园安防", "夜间安全"]) and contains_any(
+        raw_idea, ["校园", "高校", "宿舍", "停车", "道路"]
+    ):
+        candidates = [
+            {
+                "id": 1,
+                "title": "“巡安星”——面向高校校园的智能夜间巡逻小车",
+                "positioning": "面向夜间校园道路、宿舍周边和停车区域，构建自主巡逻、环境感知、异常发现与远程告警闭环。",
+                "core_tech": "移动底盘自主导航、低照度视觉、多传感器融合、远程告警",
+                "differentiator": "针对校园夜间巡查场景进行任务闭环设计",
+            },
+            {
+                "id": 2,
+                "title": "“夜巡慧眼”——融合低照度视觉与多传感器的校园安全巡查小车",
+                "positioning": "以夜间人车目标识别和异常事件发现为重点，结合巡逻路线管理与现场信息回传。",
+                "core_tech": "低照度目标检测、红外/可见光感知、边缘端推理、无线通信",
+                "differentiator": "强化夜间感知与复杂光照条件下的巡查可靠性",
+            },
+            {
+                "id": 3,
+                "title": "“校园卫士”——具备自主导航、异常识别与远程告警的夜间巡逻机器人",
+                "positioning": "面向校园安保巡查，按规划路线完成巡逻，对可疑事件进行分级记录和远程通知。",
+                "core_tech": "路径规划与避障、事件检测、定位与地图构建、告警联动",
+                "differentiator": "突出可追溯巡逻记录与人机协同处置",
+            },
+        ]
+    else:
+        name_stems = [
+            ("星", "智"), ("卫", "慧"), ("伴", "灵"), ("盾", "安"),
+            ("擎", "智"), ("航", "慧"), ("联", "云"), ("芯", "睿"),
+        ]
+        rng.shuffle(name_stems)
+        names = [
+            f"{prefix}{name_stems[0][0]}",
+            f"{name_stems[1][1]}{domain[:2]}",
+            f"{prefix}{name_stems[2][1]}",
+        ]
+        candidates = [
+            {
+                "id": 1,
+                "title": f"“{names[0]}”——面向{target}的{domain}机器人",
+                "positioning": f"围绕{function_text}形成感知—决策—执行—反馈闭环，突出实际需求解决能力。",
+                "core_tech": tech_text,
+                "differentiator": "场景需求闭环",
+            },
+            {
+                "id": 2,
+                "title": f"“{names[1]}”——基于多模态感知的{scene}{value}机器人",
+                "positioning": f"以{tech_text}为核心，强调多源信息融合、主动判断与可靠执行。",
+                "core_tech": tech_text,
+                "differentiator": "多模态感知与主动决策",
+            },
+            {
+                "id": 3,
+                "title": f"“{names[2]}”——融合智能联动与自主服务的{domain}机器人",
+                "positioning": f"突出{function_text}之间的协同联动，强调展示性、可扩展性和工程落地。",
+                "core_tech": tech_text,
+                "differentiator": "模块协同与可扩展设计",
+            },
+        ]
 
     for idx, item in enumerate(candidates):
         item["scores"] = score_candidate(fields, item, knowledge, idx)
     return candidates
 
-
 def generate_candidates(fields: Dict[str, Any], knowledge: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_idea = fields.get("raw_idea", "")
+    if contains_any(raw_idea, ["巡逻", "巡查", "校园安防", "夜间安全"]) and contains_any(
+        raw_idea, ["校园", "高校", "宿舍", "停车", "道路"]
+    ):
+        return local_generate_candidates(fields, knowledge)
+
     knowledge_summary = (
         [
             {"title": c.get("title"), "similarity": c.get("similarity", 0)}
@@ -2734,6 +2776,17 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
         fields = extract_idea_fields(raw_idea)
         knowledge = search_competition_knowledge(fields)
         candidates = generate_candidates(fields, knowledge)
+        print(
+            "CANDIDATE_RESPONSE_STATUS:",
+            {
+                "knowledge_base_connected": knowledge.get("knowledge_base_connected"),
+                "knowledge_base_used": knowledge.get("knowledge_base_used"),
+                "knowledge_lookup_status": knowledge.get("knowledge_lookup_status"),
+                "result_count": len(knowledge.get("similar_award_cases", [])) if knowledge.get("knowledge_base_used") else 0,
+                "candidate_titles": [item.get("title") for item in candidates],
+            },
+            flush=True,
+        )
 
         session.update({
             "raw_idea": raw_idea,
