@@ -2673,6 +2673,15 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
         selected = session.get("selected_title")
         fields = session.get("fields")
         knowledge = session.get("knowledge") or {}
+        if not selected or not fields:
+            return response(
+                success=False,
+                stage="report_failed",
+                intent=intent,
+                message="还没有确认最终题目。请先输入机器人创意并选择1、2或3。",
+                suggested_actions=["输入1", "输入2", "输入3"],
+            )
+
         if not knowledge.get("knowledge_base_connected") and not knowledge.get("knowledge_base_used"):
             print("KNOWLEDGE_RETRY_ON_REPORT_GENERATION:", {"session_key": session_key}, flush=True)
             refreshed_knowledge = search_competition_knowledge(fields)
@@ -2680,7 +2689,7 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
                 knowledge = refreshed_knowledge
                 session["knowledge"] = knowledge
                 if knowledge.get("knowledge_base_used"):
-                    selected = dict(selected or {})
+                    selected = dict(selected)
                     selected["scores"] = score_candidate(
                         fields, selected, knowledge, max(0, int(selected.get("id", 1)) - 1)
                     )
@@ -2690,14 +2699,6 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
                             candidate.update(selected)
                             break
                 save_session(session_key, session)
-        if not selected or not fields:
-            return response(
-                success=False,
-                stage="report_failed",
-                intent=intent,
-                message="还没有确认最终题目。请先输入机器人创意并选择1、2或3。",
-                suggested_actions=["输入1", "输入2", "输入3"],
-            )
 
         report_json = build_report_json(fields, selected, knowledge)
         report_json.setdefault("knowledge", {})["knowledge_base_connected"] = knowledge.get("knowledge_base_connected", bool(knowledge.get("knowledge_base_used")))
