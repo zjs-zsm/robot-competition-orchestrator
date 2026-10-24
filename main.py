@@ -2855,8 +2855,14 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
                 suggested_actions=["输入1", "输入2", "输入3"],
             )
 
-        if (not knowledge.get("knowledge_base_connected") and not knowledge.get("knowledge_base_used")
-                and not knowledge.get("knowledge_lookup_attempted")):
+        if (
+            not knowledge.get("knowledge_base_connected")
+            and not knowledge.get("knowledge_base_used")
+            and (
+                not knowledge.get("knowledge_lookup_attempted")
+                or knowledge.get("knowledge_lookup_status") == "unavailable"
+            )
+        ):
             print("KNOWLEDGE_RETRY_ON_REPORT_GENERATION:", {"session_key": session_key}, flush=True)
             refreshed_knowledge = search_competition_knowledge(fields)
             if refreshed_knowledge.get("knowledge_base_connected"):
