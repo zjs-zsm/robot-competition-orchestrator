@@ -457,160 +457,153 @@ keywords(list), pain_points(list), design_goal(str)。要求忠实于用户原�
 # 知识库接口：未来老师资料直接接这里
 # ============================================================
 def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict[str, Any]:
-    query = " ".join(
-        fields.get("keywords", [])
-        + fields.get("core_functions", [])
-        + fields.get("scenarios", [])
-    ).strip()
+    query_parts = []
+    for key in ("keywords", "core_functions", "scenarios", "pain_points"):
+        values = fields.get(key, [])
+        if isinstance(values, list):
+            query_parts.extend(str(value).strip() for value in values if str(value).strip())
+    query = " ".join(query_parts).strip()
 
     if KNOWLEDGE_API_URL:
         parsed_url = urllib.parse.urlsplit(KNOWLEDGE_API_URL)
-        health_url = urllib.parse.urlunsplit(
-            (parsed_url.scheme, parsed_url.netloc, "/health", "", "")
-        )
+        target_host = parsed_url.netloc
+        target_path = parsed_url.path
         headers = {
-            "User-Agent": "RobotCompetitionAssistant/4.2",
+            "User-Agent": "RobotCompetitionAssistant/4.3",
             "Content-Type": "application/json",
         }
         if KNOWLEDGE_API_KEY:
             headers["Authorization"] = f"Bearer {KNOWLEDGE_API_KEY}"
 
+        body = json.dumps(
+            {"query": query, "top_k": max(1, min(int(top_k), 10))},
+            ensure_ascii=False,
+        ).encode("utf-8")
         retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
-        health_data = None
+        backoff_seconds = [3, 8, 15, 20]
 
-        # Render free services can be asleep. Wait for a healthy database before
-        # sending a search request, rather than hammering a cold service with POSTs.
-        for attempt in range(1, 6):
+        print(
+            "KNOWLEDGE_API_TARGET:",
+            {"host": target_host, "path": target_path, "api_key_configured": bool(KNOWLEDGE_API_KEY)},
+            flush=True,
+        )
+
+        for attempt in range(1, len(backoff_seconds) + 2):
+            req = urllib.request.Request(
+                KNOWLEDGE_API_URL,
+                data=body,
+                headers=headers,
+                method="POST",
+            )
             try:
-                health_req = urllib.request.Request(
-                    health_url,
-                    headers={"User-Agent": headers["User-Agent"]},
-                    method="GET",
-                )
-                with urllib.request.urlopen(health_req, timeout=10) as health_resp:
-                    health_data = json.loads(health_resp.read().decode("utf-8"))
+                # Direct search avoids an extra health request, which is especially
+                # important when the free Render knowledge service is waking up.
+                with urllib.request.urlopen(req, timeout=18) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
 
-                if health_data.get("ok") and health_data.get("database_ready") is not False:
+                raw_results = data.get("cases") or data.get("results") or []
+                if not isinstance(raw_results, list):
+                    raw_results = []
+
+                results = []
+                for item in raw_results[:top_k]:
+                    if not isinstance(item, dict):
+                        continue
+                    normalized = dict(item)
+                    normalized["title"] = str(
+                        item.get("title") or item.get("source") or "知识库资料"
+                    )
+                    normalized["source"] = str(
+                        item.get("source") or item.get("title") or "知识库资料"
+                    )
+                    normalized["summary"] = str(
+                        item.get("summary") or item.get("content") or item.get("text") or ""
+                    )
+                    try:
+                        normalized["similarity"] = float(item.get("similarity", 0) or 0)
+                    except (TypeError, ValueError):
+                        normalized["similarity"] = 0.0
+                    results.append(normalized)
+
+                sources = data.get("sources") or list(
+                    dict.fromkeys(item["source"] for item in results)
+                )
+                if results:
                     print(
-                        "KNOWLEDGE_API_HEALTH_OK:",
+                        "KNOWLEDGE_SEARCH_SUCCESS:",
                         {
-                            "database_ready": health_data.get("database_ready"),
-                            "documents": health_data.get("documents"),
-                            "chunks": health_data.get("chunks"),
+                            "result_count": len(results),
+                            "source_count": len(sources),
+                            "query_length": len(query),
+                            "host": target_host,
                             "attempt": attempt,
                         },
                         flush=True,
                     )
-                    break
-
-                print(
-                    "KNOWLEDGE_API_NOT_READY:",
-                    {"database_ready": health_data.get("database_ready"), "attempt": attempt},
-                    flush=True,
-                )
-            except urllib.error.HTTPError as exc:
-                print(
-                    "KNOWLEDGE_API_HEALTH_HTTP_ERROR:",
-                    {"status": exc.code, "attempt": attempt},
-                    flush=True,
-                )
-                if exc.code not in retryable_statuses:
-                    break
-            except Exception as exc:
-                print(
-                    "KNOWLEDGE_API_HEALTH_ERROR:",
-                    {"type": type(exc).__name__, "attempt": attempt},
-                    flush=True,
-                )
-
-            if attempt < 5:
-                time.sleep(min(2 ** attempt, 8))
-
-        healthy = bool(
-            health_data
-            and health_data.get("ok")
-            and health_data.get("database_ready") is not False
-        )
-
-        if healthy:
-            body = json.dumps(
-                {"query": query, "top_k": top_k},
-                ensure_ascii=False,
-            ).encode("utf-8")
-
-            for attempt in range(1, 4):
-                req = urllib.request.Request(
-                    KNOWLEDGE_API_URL,
-                    data=body,
-                    headers=headers,
-                    method="POST",
-                )
-                try:
-                    with urllib.request.urlopen(req, timeout=15) as resp:
-                        data = json.loads(resp.read().decode("utf-8"))
-
-                    cases = data.get("cases") or data.get("results") or []
-                    if cases:
-                        print(
-                            "KNOWLEDGE_SEARCH_SUCCESS:",
-                            {
-                                "case_count": len(cases[:top_k]),
-                                "source_count": len(data.get("sources", [])),
-                                "query_length": len(query),
-                            },
-                            flush=True,
-                        )
-                        return {
-                            "knowledge_base_connected": True,
-                            "knowledge_base_used": True,
-                            "similar_award_cases": cases[:top_k],
-                            "knowledge_sources": data.get("sources", []),
-                            "source_type": "external_knowledge_base",
-                        }
-
-                    # A successful, empty search still proves the service is connected.
-                    print(
-                        "KNOWLEDGE_SEARCH_EMPTY:",
-                        {"query_length": len(query), "attempt": attempt},
-                        flush=True,
-                    )
                     return {
                         "knowledge_base_connected": True,
-                        "knowledge_base_used": False,
-                        "similar_award_cases": [],
-                        "knowledge_sources": data.get("sources", []),
-                        "source_type": "external_knowledge_base_empty",
+                        "knowledge_base_used": True,
+                        "similar_award_cases": results,
+                        "knowledge_sources": sources,
+                        "source_type": "external_knowledge_base",
                     }
 
-                except urllib.error.HTTPError as exc:
-                    print(
-                        "KNOWLEDGE_SEARCH_HTTP_ERROR:",
-                        {"status": exc.code, "attempt": attempt},
-                        flush=True,
-                    )
-                    if exc.code not in retryable_statuses or attempt == 3:
-                        break
-                except Exception as exc:
-                    print(
-                        "KNOWLEDGE_SEARCH_ERROR:",
-                        {"type": type(exc).__name__, "attempt": attempt},
-                        flush=True,
-                    )
-                    if attempt == 3:
-                        break
+                print(
+                    "KNOWLEDGE_SEARCH_EMPTY:",
+                    {"query_length": len(query), "host": target_host, "attempt": attempt},
+                    flush=True,
+                )
+                return {
+                    "knowledge_base_connected": True,
+                    "knowledge_base_used": False,
+                    "similar_award_cases": [],
+                    "knowledge_sources": sources,
+                    "source_type": "external_knowledge_base_empty",
+                }
 
-                if attempt < 3:
-                    time.sleep(min(2 ** attempt, 8))
-        else:
-            print("KNOWLEDGE_SEARCH_SKIPPED: health check never became ready", flush=True)
+            except urllib.error.HTTPError as exc:
+                retry_after = 0
+                try:
+                    retry_after = int(exc.headers.get("Retry-After", "0"))
+                except (TypeError, ValueError, AttributeError):
+                    retry_after = 0
+                print(
+                    "KNOWLEDGE_SEARCH_HTTP_ERROR:",
+                    {
+                        "status": exc.code,
+                        "host": target_host,
+                        "path": target_path,
+                        "attempt": attempt,
+                        "retry_after": retry_after or None,
+                    },
+                    flush=True,
+                )
+                if exc.code not in retryable_statuses or attempt >= len(backoff_seconds) + 1:
+                    break
+                time.sleep(min(max(retry_after, backoff_seconds[attempt - 1]), 25))
+            except Exception as exc:
+                print(
+                    "KNOWLEDGE_SEARCH_ERROR:",
+                    {
+                        "type": type(exc).__name__,
+                        "host": target_host,
+                        "path": target_path,
+                        "attempt": attempt,
+                    },
+                    flush=True,
+                )
+                if attempt >= len(backoff_seconds) + 1:
+                    break
+                time.sleep(backoff_seconds[attempt - 1])
     else:
         print("KNOWLEDGE_SEARCH_SKIPPED: KNOWLEDGE_API_URL is not configured", flush=True)
 
-    # The sample library is for UI/demo continuity only, never evidence for scoring.
+    # Sample cases are only for demo continuity. They are never treated as real
+    # award records and never contribute to the competitiveness score.
     scored = []
     kws = set(fields.get("keywords", []))
     for case in REFERENCE_CASES:
-        case_kws = set(case["keywords"])
+        case_kws = set(case.get("keywords", []))
         union = kws | case_kws
         sim = len(kws & case_kws) / len(union) if union else 0
         scored.append({**case, "similarity": round(sim, 3), "is_sample": True})
@@ -835,7 +828,7 @@ def format_candidate_message(fields: Dict[str, Any], candidates: List[Dict[str, 
 def _local_report(fields: Dict[str, Any], selected: Dict[str, Any], knowledge: Dict[str, Any]) -> Dict[str, Any]:
     """生成内容较完整的7页报告底稿。
 
-    这一层必须在没有外部LLM时也能独立工作；若配置LLM，build_report_json会再做一次增强。
+    这一层必须在没有外部LLM时也能独立工作；若配置LLM，build_report_json会再增强各章节内容。
     """
     title = selected["title"]
     target_list = fields.get("target_groups", []) or ["目标用户"]
@@ -1164,79 +1157,104 @@ def build_report_json(fields: Dict[str, Any], selected: Dict[str, Any], knowledg
 
     ai = call_llm_json(
         """你是中国大学生智能机器人创意竞赛设计报告专家。只返回JSON。
-必须严格输出7页，顺序固定为：1封面、2设计背景与用户需求、3整体结构、4软硬件功能、5关键技术与验证、6创新点与差异化、7应用前景与落地路径。
-每页必须内容充实、围绕本次用户创意，不得套用其他项目模板，不得重复同一句话凑字数。
-第2页至少包含2段背景、3条痛点、3条用户需求和3条设计目标。
-第3页必须有系统框图字段、至少3层架构说明、核心模块、本体结构和设计原则。
-第4页必须有硬件、软件、功能矩阵与交互逻辑。
-第5页必须有至少5个技术流程步骤、至少3项可测指标和至少3项风险控制措施。
-第6页必须有至少4个具体创新点和至少4行差异化比较。
-第7页必须有至少2段应用前景、至少4个落地阶段、社会价值与后续迭代。
-正文写出实现机制、输入输出、测试方式与验收证据；没有实际测试数据时不得编造结果。
+必须输出完整报告的七个内容模块，顺序固定为：封面、设计背景与用户需求、总体结构、软硬件功能、关键技术与验证、创新点与差异化、应用前景与落地路径。这是内容结构，不要求每个模块单独分页。
+标题必须自然、专业，禁止出现“第1页”“第2页”“第X页”等页面标签；正文不得把内部模块编号写成标题。
+各部分内容要充实、紧凑、前后衔接，不得套用其他项目内容，不得重复同一句话凑字数。
+设计背景模块至少包含2段背景、3条痛点、3条用户需求和3条设计目标。
+总体结构模块必须有系统框图字段、至少3层架构说明、核心模块、本体结构和设计原则。
+软硬件功能模块必须有硬件、软件、功能矩阵与交互逻辑。
+关键技术模块必须有至少5个技术流程步骤、至少3项可测指标和至少3项风险控制措施。
+创新点模块必须有至少4个具体创新点和至少4行差异化比较。
+应用前景模块必须有至少2段应用前景、至少4个落地阶段、社会价值与后续迭代。
+正文要说明实现机制、输入输出、测试方式与验收证据；没有实际测试数据时不得编造结果。
 返回格式：{"pages":{"page_1":{},"page_2":{},"page_3":{},"page_4":{},"page_5":{},"page_6":{},"page_7":{}}}。""",
         json.dumps({"base_report": base, "fields": fields, "selected": selected}, ensure_ascii=False),
     )
 
-    if not ai or not isinstance(ai.get("pages"), dict):
-        kb = base.get("knowledge", {})
+    if isinstance(ai, dict) and isinstance(ai.get("pages"), dict):
+        for key in [f"page_{i}" for i in range(1, 8)]:
+            base_page = base["pages"][key]
+            ai_page = ai["pages"].get(key)
+            if not isinstance(ai_page, dict):
+                continue
+            merged_page = dict(base_page)
+            merged_page["page_no"] = base_page["page_no"]
+            merged_page["module"] = base_page["module"]
+            merged_page["title"] = base_page["title"]
+            merged_page["content"] = _merge_report_content(
+                base_page.get("content", {}),
+                ai_page.get("content", {}),
+            )
+            base["pages"][key] = merged_page
+
+    # Canonical section names are used in the exported report; page keys remain
+    # internal data identifiers for backward compatibility with the existing workflow.
+    section_meta = {
+        "page_2": ("设计背景与用户需求", "一、设计背景与用户需求"),
+        "page_3": ("总体方案与系统结构", "二、总体方案与系统结构"),
+        "page_4": ("软硬件功能设计", "三、软硬件功能设计"),
+        "page_5": ("关键技术与实现路径", "四、关键技术与实现路径"),
+        "page_6": ("创新设计与差异化", "五、创新设计与差异化"),
+        "page_7": ("应用前景与落地路径", "六、应用前景与落地路径"),
+    }
+    for key, (module, title) in section_meta.items():
+        base["pages"][key]["module"] = module
+        base["pages"][key]["title"] = title
+
+    kb = base.setdefault("knowledge", {})
+    kb["knowledge_base_connected"] = bool(
+        knowledge.get("knowledge_base_connected", knowledge.get("knowledge_base_used", False))
+    )
+    kb["knowledge_base_used"] = bool(knowledge.get("knowledge_base_used", False))
+    kb["source_type"] = knowledge.get("source_type", "unknown")
+    kb["similar_award_cases"] = (
+        knowledge.get("similar_award_cases", [])[:5]
+        if kb["knowledge_base_used"]
+        else []
+    )
+    kb["knowledge_sources"] = knowledge.get("knowledge_sources", []) if kb["knowledge_base_used"] else []
+
     diff = base["pages"]["page_6"]["content"].setdefault("differentiation_analysis", {})
     if isinstance(diff, dict):
-        diff["knowledge_base_connected"] = kb.get("knowledge_base_connected", False)
-        diff["knowledge_base_used"] = kb.get("knowledge_base_used", False)
-        diff["similar_award_cases"] = kb.get("similar_award_cases", [])[:3]
+        diff["knowledge_base_connected"] = kb["knowledge_base_connected"]
+        diff["knowledge_base_used"] = kb["knowledge_base_used"]
+        diff["similar_award_cases"] = kb["similar_award_cases"][:3]
         diff["current_boundary"] = (
-            "本轮已连接知识库并检索到真实资料；相似案例用于参考对比，仍需核验来源、年份与具体作品信息。"
-            if kb.get("knowledge_base_used")
+            "已检索到相关知识库资料；相似内容仅作为方案对比参考，不等同于真实获奖概率。"
+            if kb["knowledge_base_used"]
             else (
-                "知识库已连接，但本轮没有检索到相关案例；不以示例资料代替真实获奖证据。"
-                if kb.get("knowledge_base_connected")
-                else "本轮知识库检索服务不可用；示例案例仅用于流程演示，未作为真实获奖证据。"
+                "本次检索未发现可直接对照的相关资料，创新性判断仍需结合样机测试与后续资料核验。"
+                if kb["knowledge_base_connected"]
+                else "本次未能取得可核验的知识库资料，创新性判断属于初步分析，需补充真实竞赛资料后复核。"
             )
         )
     return base
 
-    for key in [f"page_{i}" for i in range(1, 8)]:
-        base_page = base["pages"][key]
-        ai_page = ai["pages"].get(key)
-        if not isinstance(ai_page, dict):
-            continue
-        merged_page = dict(base_page)
-        # Keep the required page order and module titles; merge only substantive page content.
-        merged_page["page_no"] = base_page["page_no"]
-        merged_page["module"] = base_page["module"]
-        merged_page["title"] = base_page["title"]
-        merged_page["content"] = _merge_report_content(
-            base_page.get("content", {}),
-            ai_page.get("content", {}),
-        )
-        base["pages"][key] = merged_page
-    return base
-
-
 def format_report_summary(report_json: Dict[str, Any]) -> str:
     lines = [
-        "7页结构化竞赛报告已经生成完成。",
+        "竞赛设计报告已生成完成。",
         "",
         f"项目题目：{report_json.get('project_title', '')}",
         "",
-        "报告固定结构：",
-    ]
-    for i in range(1, 8):
-        page = report_json["pages"][f"page_{i}"]
-        lines.append(f"{i}. {page.get('title', page.get('module', ''))}")
-    lines += [
+        "报告内容包括：",
+        "设计背景与用户需求",
+        "总体方案与系统结构",
+        "软硬件功能设计",
+        "关键技术与实现路径",
+        "创新设计与差异化",
+        "应用前景与落地路径",
         "",
         "结构化数据已保存在 payload_json 中。",
-        "输入“下载报告”即可生成图文并茂的 Word 文档。",
+        "Word报告已自动生成，可通过下方下载地址获取。",
     ]
 
     kb = report_json.get("knowledge", {})
     if kb.get("knowledge_base_used"):
-        lines += ["", "知识库状态：已连接，并检索到真实资料；报告已引用相关检索结果。"]
+        lines += ["", "知识库状态：已连接并检索到相关资料，报告已纳入可核验的检索来源。"]
     elif kb.get("knowledge_base_connected"):
-        lines += ["", "知识库状态：已连接，但本轮未检索到相关案例；报告未使用示例案例作为获奖证据。"]
+        lines += ["", "知识库状态：服务已连接，但本轮未找到可直接对照的资料；报告未虚构获奖案例。"]
     else:
-        lines += ["", "知识库状态：本轮检索服务不可用或未连通；报告未引用真实获奖案例，示例案例不作为证据。"]
+        lines += ["", "知识库状态：本轮检索未成功；报告未引用未经核验的获奖案例。"]
     return "\n".join(lines)
 
 def _domain_hint(report: Dict[str, Any]) -> str:
@@ -1635,6 +1653,8 @@ def _generate_ai_visual(prompt: str, path: Path) -> bool:
 
 
 def _validate_visual_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
     try:
         with Image.open(path) as image:
             if image.width < 768 or image.height < 512:
@@ -2252,49 +2272,88 @@ def _prepare_document() -> Document:
     normal.paragraph_format.first_line_indent = Pt(0)
     normal.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     return doc
+def _add_knowledge_reference_table(doc: Document, report: Dict[str, Any]) -> None:
+    kb = report.get("knowledge", {})
+    if not kb.get("knowledge_base_used"):
+        return
+    cases = kb.get("similar_award_cases") or []
+    if not cases:
+        return
+    _add_heading(doc, "相关资料检索与方案对照", 2)
+    table = doc.add_table(rows=1, cols=3)
+    for i, label in enumerate(["资料来源", "检索内容摘要", "参考说明"]):
+        _set_cell_text(table.rows[0].cells[i], label, size=8.5, bold=True)
+        _set_cell_shading(table.rows[0].cells[i], "D9EAF7")
+    for case in cases[:3]:
+        if not isinstance(case, dict):
+            continue
+        row = table.add_row().cells
+        source = str(case.get("source") or case.get("title") or "知识库资料")
+        title = str(case.get("title") or "")
+        summary = str(case.get("summary") or case.get("content") or case.get("text") or "")
+        similarity = case.get("similarity")
+        excerpt = re.sub(r"\s+", " ", summary).strip()
+        if len(excerpt) > 280:
+            excerpt = excerpt[:280].rstrip() + "……"
+        _set_cell_text(row[0], source[:120], size=8.2, align=WD_ALIGN_PARAGRAPH.LEFT)
+        _set_cell_text(row[1], (title + ("：" if title and excerpt else "") + excerpt)[:330], size=8.2, align=WD_ALIGN_PARAGRAPH.LEFT)
+        ref_note = "用于核对方案边界与技术路线"
+        if similarity is not None:
+            try:
+                ref_note += f"；检索相关度 {float(similarity) * 100:.0f}%"
+            except (TypeError, ValueError):
+                pass
+        _set_cell_text(row[2], ref_note, size=8.2, align=WD_ALIGN_PARAGRAPH.LEFT)
+    _style_table(table, header_fill="D9EAF7")
+
+
 def _render_cover(doc: Document, report: Dict[str, Any], images: Dict[str, str]) -> None:
     _add_title(doc, report.get("project_title", "智能机器人竞赛项目"), 22)
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = p.add_run("智能机器人创意竞赛 · 项目设计报告")
-    _set_run_font(r, name="SimSun", size=13)
     p.paragraph_format.space_before = Pt(0)
     p.paragraph_format.space_after = Pt(4)
-    _add_image(doc, images.get("product"), "图1  项目产品概念效果图", 16.8)
+    r = p.add_run("智能机器人创意竞赛 · 项目设计报告")
+    _set_run_font(r, name="SimSun", size=13)
 
+    _add_image(doc, images.get("product"), "图1  项目产品概念效果图", 15.5)
     content = report.get("pages", {}).get("page_1", {}).get("content", {})
     _add_paragraph(doc, content.get("design_statement", ""), first_line=False)
 
     selected = report.get("selected_candidate", {})
-    table = doc.add_table(rows=4, cols=2)
     pairs = [
         ("项目定位", selected.get("positioning", "")),
         ("核心技术", selected.get("core_tech", "")),
-        ("差异化", selected.get("differentiator", "")),
-        ("竞赛竞争力", f"{selected.get('scores', {}).get('competitiveness_score', '')} / 100"),
+        ("创新思路", selected.get("differentiator", "")),
     ]
-    for row, (k, v) in zip(table.rows, pairs):
-        row.cells[0].text = k
-        row.cells[1].text = str(v)
+    table = doc.add_table(rows=len(pairs), cols=2)
+    for row, (label, value) in zip(table.rows, pairs):
+        _set_cell_text(row.cells[0], label, size=10, bold=True)
+        _set_cell_text(row.cells[1], str(value), size=10, align=WD_ALIGN_PARAGRAPH.LEFT)
     _style_table(table, header_fill="E8EEF7")
-    _add_cover_flow(doc, report)
-
 
 def _render_page(doc: Document, report: Dict[str, Any], page_no: int, images: Dict[str, str]) -> None:
     page = report["pages"][f"page_{page_no}"]
     content = page.get("content", {})
-    _add_heading(doc, f"第{page_no}页  {page.get('title', '')}", 1)
+    section_titles = {
+        2: "一、设计背景与用户需求",
+        3: "二、总体方案与系统结构",
+        4: "三、软硬件功能设计",
+        5: "四、关键技术与实现路径",
+        6: "五、创新设计与差异化",
+        7: "六、应用前景与落地路径",
+    }
+    _add_heading(doc, section_titles.get(page_no, page.get("title", "")), 1)
 
     if page_no == 2:
-        _add_image(doc, images.get("scene"), "图2  项目典型应用场景效果图", 14.5)
         _add_heading(doc, "设计背景", 2)
-        _add_paragraphs(doc, content.get("background_paragraphs") or content.get("background", []), 2)
-        _add_heading(doc, "用户痛点", 2)
-        _add_bullets(doc, content.get("pain_points", []), 3)
-        _add_heading(doc, "用户需求", 2)
-        _add_bullets(doc, content.get("user_needs", []), 3)
+        _add_paragraphs(doc, content.get("background_paragraphs") or content.get("background", []), 3)
+        _add_image(doc, images.get("scene"), "图2  项目典型应用场景效果图", 13.8)
+        _add_heading(doc, "用户痛点与需求", 2)
+        _add_bullets(doc, content.get("pain_points", []), 4)
+        _add_bullets(doc, content.get("user_needs", []), 5)
         _add_heading(doc, "设计目标", 2)
-        _add_bullets(doc, content.get("design_goals", []), 3)
+        _add_bullets(doc, content.get("design_goals", []), 4)
         _add_requirement_traceability_table(doc, report, content)
 
     elif page_no == 3:
@@ -2308,57 +2367,50 @@ def _render_page(doc: Document, report: Dict[str, Any], page_no: int, images: Di
         }
         _add_system_block_diagram(doc, diagram)
         _add_architecture_table(doc, content.get("system_layers", []))
-        _add_heading(doc, "核心模块", 2)
-        _add_bullets(doc, content.get("core_modules", []), 4)
-        _add_heading(doc, "本体结构思路", 2)
+        _add_heading(doc, "核心功能模块", 2)
+        _add_bullets(doc, content.get("core_modules", []), 5)
+        _add_heading(doc, "本体结构与设计原则", 2)
         _add_paragraph(doc, content.get("mechanical_concept", ""))
-        _add_heading(doc, "结构设计原则", 2)
-        _add_bullets(doc, content.get("design_principles", []), 3)
+        _add_bullets(doc, content.get("design_principles", []), 4)
 
     elif page_no == 4:
         _add_hw_sw_block_diagram(doc, content.get("hardware_software_block", {}))
-        _add_heading(doc, "硬件设计", 2)
-        _add_bullets(doc, content.get("hardware", []), 8)
+        _add_heading(doc, "硬件组成", 2)
+        _add_bullets(doc, content.get("hardware", []), 5)
         _add_heading(doc, "软件功能", 2)
-        _add_bullets(doc, content.get("software", []), 8)
+        _add_bullets(doc, content.get("software", []), 5)
         _add_function_matrix(doc, content.get("functional_matrix", []))
-        _add_heading(doc, "交互逻辑", 2)
+        _add_heading(doc, "人机交互与任务闭环", 2)
         _add_paragraph(doc, content.get("interaction_logic", ""), first_line=False)
 
     elif page_no == 5:
         _add_paragraph(doc, content.get("technical_summary", ""))
         _add_project_workflow_diagram(doc, content.get("project_workflow") or content.get("technical_route", []))
-        _add_flow_table(doc, content.get("technical_route", []))
-        _add_heading(doc, "关键技术", 2)
+        _add_heading(doc, "关键技术与实现机制", 2)
         _add_bullets(doc, content.get("key_technologies", []), 6)
-        _add_heading(doc, "量化指标", 2)
-        _add_bullets(doc, content.get("engineering_metrics", []), 6)
-        _add_heading(doc, "风险控制", 2)
-        _add_bullets(doc, content.get("risk_control", []), 6)
+        _add_heading(doc, "测试指标与验收方法", 2)
+        _add_bullets(doc, content.get("engineering_metrics", []), 5)
+        _add_heading(doc, "风险控制与可靠性设计", 2)
+        _add_bullets(doc, content.get("risk_control", []), 5)
 
     elif page_no == 6:
         _add_paragraph(doc, content.get("innovation_intro", ""))
-        _add_heading(doc, "创新点", 2)
-        _add_bullets(doc, content.get("innovation_points", []), 7)
+        _add_heading(doc, "核心创新点", 2)
+        _add_bullets(doc, content.get("innovation_points", []), 6)
         _add_comparison_table(doc, content.get("comparison", []))
         _add_innovation_validation_table(doc, content.get("innovation_points", []))
         _add_review_evidence_table(doc)
-        diff = content.get("differentiation_analysis", {})
-        note = diff.get("current_boundary") if isinstance(diff, dict) else None
-        if note:
-            _add_heading(doc, "知识库说明", 2)
-            _add_paragraph(doc, note)
+        _add_knowledge_reference_table(doc, report)
 
     elif page_no == 7:
         _add_paragraphs(doc, content.get("prospect_paragraphs", []), 4)
-        _add_heading(doc, "典型应用场景", 2)
-        _add_bullets(doc, content.get("application_scenarios", []), 6)
+        _add_heading(doc, "典型应用场景与验证方式", 2)
+        _add_bullets(doc, content.get("application_scenarios", []), 5)
         _add_application_value_table(doc, report, content)
         _add_landing_roadmap(doc, content.get("deployment_paths", []))
-        _add_heading(doc, "社会价值", 2)
-        _add_bullets(doc, content.get("social_value", []), 6)
-        _add_heading(doc, "后续迭代", 2)
-        _add_bullets(doc, content.get("future_iterations", []), 6)
+        _add_heading(doc, "社会价值与后续迭代", 2)
+        _add_bullets(doc, content.get("social_value", []), 4)
+        _add_bullets(doc, content.get("future_iterations", []), 4)
 
     _add_revision_notes(doc, content)
 
@@ -2375,12 +2427,10 @@ def export_report_to_word(report_json: Dict[str, Any], session_key: str, fast_mo
 
     for page_no in range(2, 8):
         if page_no == 2:
-            # Section break separates the unnumbered cover from consecutively numbered body pages.
+            # Keep the cover unnumbered; body sections paginate naturally and share continuous page numbering.
             body_section = doc.add_section(WD_SECTION.NEW_PAGE)
             _set_page_layout(body_section)
             _add_page_number(body_section)
-        else:
-            doc.add_page_break()
         _render_page(doc, report_json, page_no, images)
 
     digest = hashlib.sha1(
@@ -2721,9 +2771,9 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             download_url = export_info["download_url"]
             report_message = (
                 format_report_summary(report_json)
-                + "\n\nWord报告已自动生成（7页）。文档已验证包含"
+                + "\n\nWord报告已自动生成。文档已验证包含"
                 + str(export_info.get("embedded_images", 0))
-                + "张嵌入图片，以及系统框图、软硬件功能框图和项目流程图。"
+                + "张嵌入图片，以及系统架构图、软硬件功能图和技术流程图。"
                 + "\n\nWord下载地址（请点击或复制完整地址）：\n"
                 + download_url
                 + "\n\n对应题目："
@@ -2738,7 +2788,7 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
                 download_url=download_url,
                 data={"report_json": report_json, "word_file": export_info, "revision": session["report_revision"]},
                 files=[{"name": export_info["filename"], "url": download_url, "type": "docx"}],
-                suggested_actions=["下载报告", "查看报告结构数据", "修改指定页面后重新导出"],
+                suggested_actions=["下载报告", "查看报告结构数据", "按章节修改后重新导出"],
             )
         except Exception as exc:
             print("DEBUG_AUTO_WORD_ERROR:", repr(exc), flush=True)
@@ -2791,8 +2841,8 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
                 success=False,
                 stage="modify_need_target",
                 intent=intent,
-                message="可以修改。请告诉我要修改第1至第7页中的哪一页，例如：‘修改第3页，在系统框图中增加云端知识库模块’。",
-                suggested_actions=["修改第3页系统框图", "修改第5页项目流程图", "修改第6页创新点"],
+                message="可以修改。请告诉我要调整的章节或具体内容，例如：‘完善系统总体架构，在系统框图中增加云端知识库模块’。",
+                suggested_actions=["完善系统架构图", "优化技术流程图", "补充创新点"],
             )
 
         key = f"page_{page_no}"
@@ -2899,7 +2949,7 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             ),
             payload_json=json.dumps(session.get("report_json", {}), ensure_ascii=False, indent=2),
             data={"report_json": session.get("report_json", {}), "revision": session.get("report_revision", 1)},
-            suggested_actions=["下载报告", "修改第3页系统框图", "优化第5页流程图"],
+            suggested_actions=["下载报告", "完善系统架构图", "优化技术流程图"],
         )
 
     return response(
@@ -2931,11 +2981,12 @@ def health() -> Dict[str, Any]:
 
 @app.get("/api/v1/diagnostics/knowledge")
 def diagnose_knowledge() -> Dict[str, Any]:
-    """Safely verify the configured knowledge API end-to-end without exposing secrets or document contents."""
+    """Check live knowledge retrieval without exposing credentials or document text."""
     if not KNOWLEDGE_API_URL:
         return {
             "ok": False,
             "configured": False,
+            "knowledge_base_connected": False,
             "knowledge_base_used": False,
             "source_type": "not_configured",
             "returned_results": 0,
@@ -2946,20 +2997,31 @@ def diagnose_knowledge() -> Dict[str, Any]:
         "keywords": ["智能小车", "机器人竞赛", "获奖项目"],
         "core_functions": ["自主导航", "避障"],
         "scenarios": ["校园"],
+        "pain_points": ["竞赛作品设计"],
     }
     result = search_competition_knowledge(fields, top_k=3)
     cases = result.get("similar_award_cases") or []
     used = bool(result.get("knowledge_base_used"))
+    connected = bool(result.get("knowledge_base_connected"))
+    parsed = urllib.parse.urlsplit(KNOWLEDGE_API_URL)
+    if used:
+        message = "Live knowledge search succeeded."
+    elif connected:
+        message = "Knowledge service is reachable, but this query returned no usable records."
+    else:
+        message = "Knowledge service could not be reached; inspect the sanitized target and HTTP status in Render logs."
     return {
-        "ok": used,
+        "ok": connected,
         "configured": True,
+        "knowledge_base_connected": connected,
         "knowledge_base_used": used,
         "source_type": result.get("source_type", "unknown"),
         "returned_results": len(cases) if used else 0,
         "sample_fallback": result.get("source_type") == "sample_case_library",
-        "message": "Live knowledge search succeeded." if used else "The service is configured, but live search did not return usable records; inspect Render logs for status/auth errors.",
+        "target_host": parsed.netloc,
+        "target_path": parsed.path,
+        "message": message,
     }
-
 
 @app.post("/api/v1/robot-competition/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
