@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import json
@@ -1025,27 +1026,103 @@ def _local_report(fields: Dict[str, Any], selected: Dict[str, Any], knowledge: D
         "generated_at": now_iso(),
     }
 
+def _content_size(value: Any) -> int:
+    if isinstance(value, str):
+        return len(value.strip())
+    if isinstance(value, dict):
+        return sum(_content_size(v) for v in value.values())
+    if isinstance(value, list):
+        return sum(_content_size(v) for v in value)
+    return len(str(value)) if value is not None else 0
+
+
+def _merge_report_content(base_value: Any, ai_value: Any, key: str = "") -> Any:
+    if ai_value is None or ai_value == "" or ai_value == [] or ai_value == {}:
+        return base_value
+
+    if isinstance(base_value, dict):
+        if not isinstance(ai_value, dict):
+            return base_value
+        merged = dict(base_value)
+        for child_key, child_value in ai_value.items():
+            if child_key in base_value:
+                merged[child_key] = _merge_report_content(base_value[child_key], child_value, child_key)
+            elif child_value not in (None, "", [], {}):
+                merged[child_key] = child_value
+        return merged
+
+    if isinstance(base_value, list):
+        if not isinstance(ai_value, list):
+            return base_value
+        min_items = {
+            "background_paragraphs": 2, "pain_points": 3, "user_needs": 3, "design_goals": 3,
+            "system_layers": 3, "core_modules": 3, "design_principles": 3,
+            "hardware": 3, "software": 3, "functional_matrix": 3,
+            "key_technologies": 3, "technical_route": 5, "project_workflow": 5,
+            "engineering_metrics": 3, "risk_control": 3, "innovation_points": 4,
+            "comparison": 4, "prospect_paragraphs": 2, "deployment_paths": 4,
+            "social_value": 3, "future_iterations": 3,
+        }.get(key, 1)
+        min_chars = {
+            "background_paragraphs": 220, "hardware": 220, "software": 220,
+            "key_technologies": 260, "innovation_points": 220, "comparison": 180,
+            "prospect_paragraphs": 220,
+        }.get(key, 0)
+        if len(ai_value) < min_items or _content_size(ai_value) < min_chars:
+            return base_value
+        return ai_value
+
+    if isinstance(base_value, str):
+        if not isinstance(ai_value, str):
+            return base_value
+        candidate = ai_value.strip()
+        min_chars = {
+            "design_statement": 100, "overview": 90, "mechanical_concept": 90,
+            "technical_summary": 90, "innovation_intro": 80, "interaction_logic": 60,
+        }.get(key, 0)
+        if not candidate or (len(candidate) < min_chars and len(base_value.strip()) > len(candidate)):
+            return base_value
+        return candidate
+
+    return ai_value
+
+
 def build_report_json(fields: Dict[str, Any], selected: Dict[str, Any], knowledge: Dict[str, Any]) -> Dict[str, Any]:
     base = _local_report(fields, selected, knowledge)
 
     ai = call_llm_json(
-        """你是智能机器人竞赛设计报告专家。只返回JSON。
-必须保持严格7页：page_1封面、page_2设计背景、page_3整体结构、page_4软硬件功能、page_5关键技术、page_6创新点、page_7应用前景。
-内容必须完全围绕给定用户创意和已选题目，禁止套用老人陪护固定模板。每页内容要专业、具体、可落地。
-返回格式：{"pages":{...}}，不要删除页码/module/title/content字段。""",
+        """你是中国大学生智能机器人创意竞赛设计报告专家。只返回JSON。
+必须严格输出7页，顺序固定为：1封面、2设计背景与用户需求、3整体结构、4软硬件功能、5关键技术与验证、6创新点与差异化、7应用前景与落地路径。
+每页必须内容充实、围绕本次用户创意，不得套用其他项目模板，不得重复同一句话凑字数。
+第2页至少包含2段背景、3条痛点、3条用户需求和3条设计目标。
+第3页必须有系统框图字段、至少3层架构说明、核心模块、本体结构和设计原则。
+第4页必须有硬件、软件、功能矩阵与交互逻辑。
+第5页必须有至少5个技术流程步骤、至少3项可测指标和至少3项风险控制措施。
+第6页必须有至少4个具体创新点和至少4行差异化比较。
+第7页必须有至少2段应用前景、至少4个落地阶段、社会价值与后续迭代。
+正文写出实现机制、输入输出、测试方式与验收证据；没有实际测试数据时不得编造结果。
+返回格式：{"pages":{"page_1":{},"page_2":{},"page_3":{},"page_4":{},"page_5":{},"page_6":{},"page_7":{}}}。""",
         json.dumps({"base_report": base, "fields": fields, "selected": selected}, ensure_ascii=False),
     )
 
-    if ai and isinstance(ai.get("pages"), dict):
-        # 只替换7页内容，保留元数据和知识库字段
-        for key in [f"page_{i}" for i in range(1, 8)]:
-            if isinstance(ai["pages"].get(key), dict):
-                page = ai["pages"][key]
-                page.setdefault("page_no", int(key.split("_")[1]))
-                page.setdefault("module", base["pages"][key]["module"])
-                page.setdefault("title", base["pages"][key]["title"])
-                page.setdefault("content", base["pages"][key]["content"])
-                base["pages"][key] = page
+    if not ai or not isinstance(ai.get("pages"), dict):
+        return base
+
+    for key in [f"page_{i}" for i in range(1, 8)]:
+        base_page = base["pages"][key]
+        ai_page = ai["pages"].get(key)
+        if not isinstance(ai_page, dict):
+            continue
+        merged_page = dict(base_page)
+        # Keep the required page order and module titles; merge only substantive page content.
+        merged_page["page_no"] = base_page["page_no"]
+        merged_page["module"] = base_page["module"]
+        merged_page["title"] = base_page["title"]
+        merged_page["content"] = _merge_report_content(
+            base_page.get("content", {}),
+            ai_page.get("content", {}),
+        )
+        base["pages"][key] = merged_page
     return base
 
 
@@ -1468,70 +1545,126 @@ def _generate_ai_visual(prompt: str, path: Path) -> bool:
     return _generic_image_api(prompt, path) or _pollinations_image(prompt, path)
 
 
-def generate_project_images(report: Dict[str, Any], session_key: str, fast_mode: bool = False) -> Dict[str, str]:
-    digest = hashlib.sha1(f"{session_key}-{report.get('project_title','')}".encode("utf-8")).hexdigest()[:10]
-    result: Dict[str, str] = {}
-    ai_configured = bool(POLLINATIONS_API_KEY or IMAGE_API_URL)
+def _validate_visual_file(path: Path) -> bool:
+    try:
+        with Image.open(path) as image:
+            if image.width < 768 or image.height < 512:
+                return False
+            image.verify()
+        return path.exists() and path.stat().st_size > 15000
+    except Exception as exc:
+        print("VISUAL_VALIDATION_ERROR:", {"file": path.name, "type": type(exc).__name__}, flush=True)
+        return False
 
-    # 第1页：产品英雄图
+
+def generate_project_images(report: Dict[str, Any], session_key: str, fast_mode: bool = False) -> Dict[str, str]:
+    """Generate two distinct, high-quality AI visuals; never silently replace them with line drawings."""
+    digest = hashlib.sha1(
+        f"{session_key}-{report.get('project_title', '')}".encode("utf-8")
+    ).hexdigest()[:10]
     product_path = EXPORT_DIR / f"visual_product_{digest}.png"
-    if fast_mode:
-        # Chaoxing's workflow can time out while waiting for external image APIs.
-        # Fast export uses local illustrative images; the Word-native system/workflow diagrams remain editable.
-        _fallback_robot_illustration(report, product_path, scene=False)
-        scene_path = EXPORT_DIR / f"visual_scene_{digest}.png"
-        _fallback_robot_illustration(report, scene_path, scene=True)
-        result["product"] = str(product_path)
-        result["scene"] = str(scene_path)
-        return result
+    scene_path = EXPORT_DIR / f"visual_scene_{digest}.png"
+
+    ai_configured = bool(POLLINATIONS_API_KEY or IMAGE_API_URL)
+    if not ai_configured:
+        raise RuntimeError(
+            "高质量图片生成未配置：请检查 Render 主服务的 POLLINATIONS_API_KEY / "
+            "IMAGE_API_URL 环境变量。为避免再次生成低质量简笔画，本次已停止导出。"
+        )
+
+    # Reuse already generated high-resolution AI images for the same project/session.
+    # This keeps the subsequent download action fast and prevents the two actions from
+    # regenerating different images for the same report.
+    product_cached = _validate_visual_file(product_path)
+    scene_cached = _validate_visual_file(scene_path)
+    if product_cached and scene_cached:
+        similarity = _image_similarity(product_path, scene_path)
+        if similarity < 0.86:
+            print(
+                "AI_VISUALS_REUSED:",
+                {"product_bytes": product_path.stat().st_size,
+                 "scene_bytes": scene_path.stat().st_size,
+                 "similarity": round(similarity, 3)},
+                flush=True,
+            )
+            return {"product": str(product_path), "scene": str(scene_path)}
 
     product_prompt = _visual_prompt(report, "product")
-    product_ok = _generate_ai_visual(product_prompt, product_path) if ai_configured else False
+    scene_prompt = (
+        _visual_prompt(report, "scene")
+        + "\nComposition: wide real-world documentary photograph, distinct from the studio product hero render; "
+          "show one concrete task in progress, believable proportions, natural material detail, "
+          "realistic shadows and reflections, no collage, no diagram, no illustration."
+    )
+
+    def generate_one(prompt: str, path: Path, label: str) -> bool:
+        try:
+            ok = _generate_ai_visual(prompt, path)
+            if not ok:
+                print("AI_VISUAL_GENERATION_FAILED:", label, flush=True)
+                return False
+            if not _validate_visual_file(path):
+                print("AI_VISUAL_INVALID_FILE:", label, flush=True)
+                return False
+            return True
+        except Exception as exc:
+            print("AI_VISUAL_EXCEPTION:", {"image": label, "type": type(exc).__name__}, flush=True)
+            return False
+
+    # Run both image requests concurrently so the Chaoxing workflow does not spend
+    # two full image-generation timeouts waiting sequentially.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        product_future = pool.submit(generate_one, product_prompt, product_path, "product")
+        scene_future = pool.submit(generate_one, scene_prompt, scene_path, "scene")
+        product_ok = product_future.result()
+        scene_ok = scene_future.result()
 
     if not product_ok:
-        if ai_configured and STRICT_AI_IMAGES:
-            raise RuntimeError(
-                "第1页AI产品效果图生成失败。为避免再次输出简笔画，已停止Word导出；请查看Render日志中的POLLINATIONS_*错误后重试。"
-            )
-        # 本地/无密钥测试环境仍允许开放图片兜底，便于验证Word主流程
-        product_ok = _wikimedia_commons_image(report, "product", product_path)
-        if not product_ok:
-            _fallback_robot_illustration(report, product_path, scene=False)
-    result["product"] = str(product_path)
-
-    # 第2页：真实应用场景图。最多3次，若与封面过于相似则重生成。
-    scene_path = EXPORT_DIR / f"visual_scene_{digest}.png"
-    scene_prompt_base = _visual_prompt(report, "scene")
-    scene_ok = False
-    for attempt in range(1, 4):
-        attempt_prompt = (
-            scene_prompt_base
-            + f"\nComposition variation {attempt}: use a clearly different camera angle, environment and task moment from the product hero image."
+        raise RuntimeError(
+            "第1页AI产品效果图生成失败。未使用程序绘制的简笔画替代；请检查 Render 日志中的 "
+            "POLLINATIONS_* 或 IMAGE_API 错误后重试。"
         )
-        if ai_configured:
-            scene_ok = _generate_ai_visual(attempt_prompt, scene_path)
-        else:
-            scene_ok = False
-        if not scene_ok:
-            continue
-        similarity = _image_similarity(product_path, scene_path)
-        print(f"VISUAL_SIMILARITY_PRODUCT_SCENE: {similarity:.3f} attempt={attempt}", flush=True)
-        if similarity < 0.86:
-            break
-        scene_ok = False
-
     if not scene_ok:
-        if ai_configured and STRICT_AI_IMAGES:
-            raise RuntimeError(
-                "第2页AI应用场景图生成失败或与封面过于相似。为保证图文质量，已停止Word导出，请重新尝试。"
-            )
-        scene_ok = _wikimedia_commons_image(report, "scene", scene_path)
-        if not scene_ok:
-            _fallback_robot_illustration(report, scene_path, scene=True)
-    result["scene"] = str(scene_path)
+        raise RuntimeError(
+            "第2页真实应用场景图生成失败。为保证报告质量，未使用低质量占位图；请检查 Render 图片生成日志后重试。"
+        )
 
-    return result
+    similarity = _image_similarity(product_path, scene_path)
+    max_attempts = 2 if fast_mode else 3
+    attempt = 1
+    while similarity >= 0.86 and attempt < max_attempts:
+        attempt += 1
+        variation_prompt = (
+            _visual_prompt(report, "scene")
+            + f"\nComposition variation {attempt}: change camera position, background, lighting, "
+              "task moment and spatial arrangement substantially. Keep the robot performing a clear real task. "
+              "This must not resemble a studio product render. Photorealistic, no text, no logo, no watermark."
+        )
+        if not generate_one(variation_prompt, scene_path, f"scene_retry_{attempt}"):
+            break
+        similarity = _image_similarity(product_path, scene_path)
+        print(
+            "VISUAL_SIMILARITY_PRODUCT_SCENE:",
+            {"similarity": round(similarity, 3), "attempt": attempt},
+            flush=True,
+        )
 
+    if similarity >= 0.86:
+        raise RuntimeError(
+            "第2页场景图与产品效果图过于相似，无法保证两页图像各自表达清楚；请重新生成报告。"
+        )
+
+    print(
+        "AI_VISUALS_READY:",
+        {
+            "product_bytes": product_path.stat().st_size,
+            "scene_bytes": scene_path.stat().st_size,
+            "similarity": round(similarity, 3),
+            "fast_mode": fast_mode,
+        },
+        flush=True,
+    )
+    return {"product": str(product_path), "scene": str(scene_path)}
 # ============================================================
 # Word 美化与图文排版
 # ============================================================
@@ -1787,7 +1920,7 @@ def _add_hw_sw_block_diagram(doc: Document, diagram: Dict[str, Any]) -> None:
         _set_cell_shading(table.cell(0, i), fills[i])
         _set_cell_text(table.cell(0, i), h, size=10, bold=True)
         vals = diagram.get(keys[i], []) or []
-        _set_cell_text(table.cell(1, i), "\\n↓\\n".join([str(x) for x in vals[:5]]), size=9.3)
+        _set_cell_text(table.cell(1, i), "\n↓\n".join([str(x) for x in vals[:5]]), size=9.3)
     _style_table(table, header_fill="D9EAF7")
     _add_figure_caption(doc, "图4  项目软硬件功能框图")
     p = doc.add_paragraph()
@@ -1813,6 +1946,36 @@ def _add_project_workflow_diagram(doc: Document, steps: List[str]) -> None:
         if i < len(steps) - 1:
             _set_cell_text(table.cell(0, i * 2 + 1), "→", size=14, bold=True)
     _add_figure_caption(doc, "图5  项目运行与任务闭环流程")
+def _add_innovation_validation_table(doc: Document, items: Any) -> None:
+    if not isinstance(items, list) or not items:
+        return
+    _add_heading(doc, "创新点验证方法与评价证据", 2)
+    table = doc.add_table(rows=1, cols=3)
+    headers = ["创新维度", "实现机制", "建议验证方式与证据"]
+    for i, header in enumerate(headers):
+        _set_cell_shading(table.cell(0, i), "D9EAF7")
+        _set_cell_text(table.cell(0, i), header, size=8.8, bold=True)
+
+    methods = [
+        "用目标场景任务清单逐项核验，记录需求、功能与测试用例的对应关系。",
+        "进行端到端任务测试，保存触发、执行、确认和异常处理日志。",
+        "开展跨模块联合测试，记录任务成功率、响应时间及模块间状态一致性。",
+        "进行连续运行和故障注入测试，记录恢复时间、失败原因与安全保护行为。",
+    ]
+    for index, item in enumerate(items[:4]):
+        if isinstance(item, dict):
+            name = str(item.get("name") or item.get("title") or f"创新点{index + 1}")
+            description = str(item.get("description") or item.get("implementation") or "")
+        else:
+            name = f"创新点{index + 1}"
+            description = str(item)
+        row = table.add_row().cells
+        _set_cell_text(row[0], name, size=8.2, bold=True)
+        _set_cell_text(row[1], description[:150], size=8.0, align=WD_ALIGN_PARAGRAPH.LEFT)
+        _set_cell_text(row[2], methods[index], size=8.0, align=WD_ALIGN_PARAGRAPH.LEFT)
+    _style_table(table, header_fill="D9EAF7")
+
+
 def _add_landing_roadmap(doc: Document, steps: List[str]) -> None:
     _add_heading(doc, "项目落地路线图", 2)
     steps = [str(s) for s in steps if str(s).strip()][:6]
@@ -1999,6 +2162,7 @@ def _render_page(doc: Document, report: Dict[str, Any], page_no: int, images: Di
         _add_heading(doc, "创新点", 2)
         _add_bullets(doc, content.get("innovation_points", []), 7)
         _add_comparison_table(doc, content.get("comparison", []))
+        _add_innovation_validation_table(doc, content.get("innovation_points", []))
         diff = content.get("differentiation_analysis", {})
         note = diff.get("current_boundary") if isinstance(diff, dict) else None
         if note:
@@ -2078,7 +2242,7 @@ def export_report_to_word(report_json: Dict[str, Any], session_key: str, fast_mo
         "filename": filename,
         "file_path": str(path),
         "download_url": f"{PUBLIC_BASE_URL}/api/v1/robot-competition/download/{filename}",
-        "visual_mode": "offline_stylized_illustrations_plus_native_diagrams" if fast_mode else ("ai_generated_strict" if (POLLINATIONS_API_KEY or IMAGE_API_URL) else "offline_fallback"),
+        "visual_mode": "ai_generated_product_and_scene_plus_native_diagrams",
         "project_title": project_title,
         "embedded_images": len(embedded_images),
         "size_bytes": file_size,
