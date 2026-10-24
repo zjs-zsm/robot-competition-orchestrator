@@ -461,98 +461,152 @@ def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict
         fields.get("keywords", [])
         + fields.get("core_functions", [])
         + fields.get("scenarios", [])
-    )
+    ).strip()
 
     if KNOWLEDGE_API_URL:
-        # Ping the lightweight health endpoint first: a free Render KB service may be asleep.
-        # Never log the endpoint or API key; only log readiness fields.
-        try:
-            parsed_url = urllib.parse.urlsplit(KNOWLEDGE_API_URL)
-            health_url = urllib.parse.urlunsplit((parsed_url.scheme, parsed_url.netloc, "/health", "", ""))
-            health_req = urllib.request.Request(
-                health_url,
-                headers={"User-Agent": "RobotCompetitionAssistant/4.1"},
-                method="GET",
-            )
-            with urllib.request.urlopen(health_req, timeout=8) as health_resp:
-                health_data = json.loads(health_resp.read().decode("utf-8"))
-            print(
-                "KNOWLEDGE_API_HEALTH:",
-                {"ok": health_data.get("ok"), "database_ready": health_data.get("database_ready")},
-                flush=True,
-            )
-            if health_data.get("database_ready") is False:
-                time.sleep(2)
-        except Exception as exc:
-            print("KNOWLEDGE_API_HEALTH_ERROR:", {"type": type(exc).__name__}, flush=True)
-            time.sleep(2)
-
-        body = json.dumps({"query": query, "top_k": top_k}, ensure_ascii=False).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
+        parsed_url = urllib.parse.urlsplit(KNOWLEDGE_API_URL)
+        health_url = urllib.parse.urlunsplit(
+            (parsed_url.scheme, parsed_url.netloc, "/health", "", "")
+        )
+        headers = {
+            "User-Agent": "RobotCompetitionAssistant/4.2",
+            "Content-Type": "application/json",
+        }
         if KNOWLEDGE_API_KEY:
             headers["Authorization"] = f"Bearer {KNOWLEDGE_API_KEY}"
 
-        # Render free services may be waking from idle. Retry transient gateway,
-        # timeout and connection errors rather than immediately falling back to samples.
-        retryable_statuses = {408, 429, 500, 502, 503, 504}
-        for attempt in range(1, 7):
-            req = urllib.request.Request(
-                KNOWLEDGE_API_URL,
-                data=body,
-                headers=headers,
-                method="POST",
-            )
+        retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
+        health_data = None
+
+        # Render free services can be asleep. Wait for a healthy database before
+        # sending a search request, rather than hammering a cold service with POSTs.
+        for attempt in range(1, 6):
             try:
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
+                health_req = urllib.request.Request(
+                    health_url,
+                    headers={"User-Agent": headers["User-Agent"]},
+                    method="GET",
+                )
+                with urllib.request.urlopen(health_req, timeout=10) as health_resp:
+                    health_data = json.loads(health_resp.read().decode("utf-8"))
 
-                cases = data.get("cases") or data.get("results") or []
-                if cases:
-                    return {
-                        "knowledge_base_used": True,
-                        "similar_award_cases": cases[:top_k],
-                        "knowledge_sources": data.get("sources", []),
-                        "source_type": "external_knowledge_base",
-                    }
+                if health_data.get("ok") and health_data.get("database_ready") is not False:
+                    print(
+                        "KNOWLEDGE_API_HEALTH_OK:",
+                        {
+                            "database_ready": health_data.get("database_ready"),
+                            "documents": health_data.get("documents"),
+                            "chunks": health_data.get("chunks"),
+                            "attempt": attempt,
+                        },
+                        flush=True,
+                    )
+                    break
 
-                # A reachable API with no matching records is not evidence of real
-                # award cases; preserve the existing honest sample-library fallback.
                 print(
-                    "KNOWLEDGE_API_EMPTY_RESULT:",
-                    {"query_length": len(query), "attempt": attempt},
+                    "KNOWLEDGE_API_NOT_READY:",
+                    {"database_ready": health_data.get("database_ready"), "attempt": attempt},
                     flush=True,
                 )
-                break
-
             except urllib.error.HTTPError as exc:
                 print(
-                    "KNOWLEDGE_API_HTTP_ERROR:",
+                    "KNOWLEDGE_API_HEALTH_HTTP_ERROR:",
                     {"status": exc.code, "attempt": attempt},
                     flush=True,
                 )
-                if exc.code not in retryable_statuses or attempt == 6:
-                    break
-            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
-                print(
-                    "KNOWLEDGE_API_CONNECTION_ERROR:",
-                    {"type": type(exc).__name__, "attempt": attempt},
-                    flush=True,
-                )
-                if attempt == 6:
+                if exc.code not in retryable_statuses:
                     break
             except Exception as exc:
                 print(
-                    "KNOWLEDGE_API_ERROR:",
+                    "KNOWLEDGE_API_HEALTH_ERROR:",
                     {"type": type(exc).__name__, "attempt": attempt},
                     flush=True,
                 )
-                break
 
-            # Exponential backoff capped at 8s; allow enough time for a sleeping Render KB
-            # service to complete its ~20-25s cold start before giving up.
-            time.sleep(min(2 ** attempt, 8))
+            if attempt < 5:
+                time.sleep(min(2 ** attempt, 8))
 
-    # No usable records from the external API: sample cases are placeholders only.
+        healthy = bool(
+            health_data
+            and health_data.get("ok")
+            and health_data.get("database_ready") is not False
+        )
+
+        if healthy:
+            body = json.dumps(
+                {"query": query, "top_k": top_k},
+                ensure_ascii=False,
+            ).encode("utf-8")
+
+            for attempt in range(1, 4):
+                req = urllib.request.Request(
+                    KNOWLEDGE_API_URL,
+                    data=body,
+                    headers=headers,
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+
+                    cases = data.get("cases") or data.get("results") or []
+                    if cases:
+                        print(
+                            "KNOWLEDGE_SEARCH_SUCCESS:",
+                            {
+                                "case_count": len(cases[:top_k]),
+                                "source_count": len(data.get("sources", [])),
+                                "query_length": len(query),
+                            },
+                            flush=True,
+                        )
+                        return {
+                            "knowledge_base_connected": True,
+                            "knowledge_base_used": True,
+                            "similar_award_cases": cases[:top_k],
+                            "knowledge_sources": data.get("sources", []),
+                            "source_type": "external_knowledge_base",
+                        }
+
+                    # A successful, empty search still proves the service is connected.
+                    print(
+                        "KNOWLEDGE_SEARCH_EMPTY:",
+                        {"query_length": len(query), "attempt": attempt},
+                        flush=True,
+                    )
+                    return {
+                        "knowledge_base_connected": True,
+                        "knowledge_base_used": False,
+                        "similar_award_cases": [],
+                        "knowledge_sources": data.get("sources", []),
+                        "source_type": "external_knowledge_base_empty",
+                    }
+
+                except urllib.error.HTTPError as exc:
+                    print(
+                        "KNOWLEDGE_SEARCH_HTTP_ERROR:",
+                        {"status": exc.code, "attempt": attempt},
+                        flush=True,
+                    )
+                    if exc.code not in retryable_statuses or attempt == 3:
+                        break
+                except Exception as exc:
+                    print(
+                        "KNOWLEDGE_SEARCH_ERROR:",
+                        {"type": type(exc).__name__, "attempt": attempt},
+                        flush=True,
+                    )
+                    if attempt == 3:
+                        break
+
+                if attempt < 3:
+                    time.sleep(min(2 ** attempt, 8))
+        else:
+            print("KNOWLEDGE_SEARCH_SKIPPED: health check never became ready", flush=True)
+    else:
+        print("KNOWLEDGE_SEARCH_SKIPPED: KNOWLEDGE_API_URL is not configured", flush=True)
+
+    # The sample library is for UI/demo continuity only, never evidence for scoring.
     scored = []
     kws = set(fields.get("keywords", []))
     for case in REFERENCE_CASES:
@@ -562,15 +616,13 @@ def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict
         scored.append({**case, "similarity": round(sim, 3), "is_sample": True})
     scored.sort(key=lambda x: x["similarity"], reverse=True)
     return {
+        "knowledge_base_connected": False,
         "knowledge_base_used": False,
         "similar_award_cases": scored[:top_k],
         "knowledge_sources": [],
         "source_type": "sample_case_library",
     }
 
-# ============================================================
-# 动态候选题目
-# ============================================================
 def score_candidate(
     fields: Dict[str, Any],
     candidate: Dict[str, Any],
@@ -584,7 +636,7 @@ def score_candidate(
     similar_cases = knowledge.get("similar_award_cases", [])
     highest_similarity = 0.0
     similar_case = {}
-    if similar_cases:
+    if knowledge.get("knowledge_base_used") and similar_cases:
         highest_similarity = float(similar_cases[0].get("similarity", 0) or 0)
         similar_case = similar_cases[0]
 
@@ -599,7 +651,7 @@ def score_candidate(
     if candidate.get("differentiator"):
         innovation += 2
 
-    similarity_penalty = highest_similarity * (12 if knowledge.get("knowledge_base_used") else 6)
+    similarity_penalty = highest_similarity * 12 if knowledge.get("knowledge_base_used") else 0
     feasibility_penalty = 0
     if function_count >= 7 and tech_count <= 2:
         feasibility_penalty = 8
@@ -699,10 +751,14 @@ def local_generate_candidates(fields: Dict[str, Any], knowledge: Dict[str, Any])
 
 
 def generate_candidates(fields: Dict[str, Any], knowledge: Dict[str, Any]) -> List[Dict[str, Any]]:
-    knowledge_summary = [
-        {"title": c.get("title"), "similarity": c.get("similarity", 0)}
-        for c in knowledge.get("similar_award_cases", [])[:3]
-    ]
+    knowledge_summary = (
+        [
+            {"title": c.get("title"), "similarity": c.get("similarity", 0)}
+            for c in knowledge.get("similar_award_cases", [])[:3]
+        ]
+        if knowledge.get("knowledge_base_used")
+        else []
+    )
 
     ai = call_llm_json(
         """你是中国大学生智能机器人创意竞赛命题专家。只返回JSON。
@@ -758,17 +814,24 @@ def format_candidate_message(fields: Dict[str, Any], candidates: List[Dict[str, 
         ]
 
     if knowledge.get("knowledge_base_used"):
-        lines += ["", "已接入真实知识库，本轮评分已参考知识库检索结果。"]
+        sources = "、".join(knowledge.get("knowledge_sources", [])[:3])
+        lines += ["", "知识库状态：已连接，并检索到真实资料；本轮评分参考了检索结果。"]
+        if sources:
+            lines.append("检索来源：" + sources)
+    elif knowledge.get("knowledge_base_connected"):
+        lines += [
+            "",
+            "知识库状态：服务已连接，但本轮未检索到相关案例；没有使用示例案例作为获奖依据。",
+        ]
     else:
-        lines += ["", "说明：当前尚未接入老师提供的真实往届资料，相似案例仅用于流程验证；评分不是实际获奖概率。"]
+        lines += [
+            "",
+            "知识库状态：本轮检索服务暂不可用。以下示例案例仅用于界面演示，不作为真实获奖证据，也不参与相似度扣分。",
+        ]
 
     lines += ["", "请输入 1、2、3 选择题目；输入“重新生成”换一批；也可以继续补充你的创意要求。"]
     return "\n".join(lines)
 
-
-# ============================================================
-# 7页动态报告
-# ============================================================
 def _local_report(fields: Dict[str, Any], selected: Dict[str, Any], knowledge: Dict[str, Any]) -> Dict[str, Any]:
     """生成内容较完整的7页报告底稿。
 
@@ -967,7 +1030,15 @@ def _local_report(fields: Dict[str, Any], selected: Dict[str, Any], knowledge: D
                 "differentiation_analysis": {
                     "knowledge_base_used": knowledge.get("knowledge_base_used", False),
                     "similar_award_cases": knowledge.get("similar_award_cases", [])[:3],
-                    "current_boundary": "未接入老师提供的真实获奖资料时，不把样例相似度宣传为真实获奖证据。",
+                    "current_boundary": (
+                        "本轮已连接知识库并检索到真实资料；相似案例用于参考对比，仍需核验来源、年份与具体作品信息。"
+                        if knowledge.get("knowledge_base_used")
+                        else (
+                            "知识库已连接，但本轮没有检索到相关案例；不以示例资料代替真实获奖证据。"
+                            if knowledge.get("knowledge_base_connected")
+                            else "本轮知识库检索服务不可用；示例案例仅用于流程演示，未作为真实获奖证据。"
+                        )
+                    ),
                     "selected_differentiator": differentiator,
                 },
             },
@@ -1016,6 +1087,7 @@ def _local_report(fields: Dict[str, Any], selected: Dict[str, Any], knowledge: D
         "selected_candidate": selected,
         "idea_fields": fields,
         "knowledge": {
+            "knowledge_base_connected": knowledge.get("knowledge_base_connected", bool(knowledge.get("knowledge_base_used", False))),
             "knowledge_base_used": knowledge.get("knowledge_base_used", False),
             "similar_award_cases": knowledge.get("similar_award_cases", [])[:5],
             "similarity_score": (knowledge.get("similar_award_cases") or [{}])[0].get("similarity") if knowledge.get("similar_award_cases") else None,
@@ -1106,7 +1178,22 @@ def build_report_json(fields: Dict[str, Any], selected: Dict[str, Any], knowledg
     )
 
     if not ai or not isinstance(ai.get("pages"), dict):
-        return base
+        kb = base.get("knowledge", {})
+    diff = base["pages"]["page_6"]["content"].setdefault("differentiation_analysis", {})
+    if isinstance(diff, dict):
+        diff["knowledge_base_connected"] = kb.get("knowledge_base_connected", False)
+        diff["knowledge_base_used"] = kb.get("knowledge_base_used", False)
+        diff["similar_award_cases"] = kb.get("similar_award_cases", [])[:3]
+        diff["current_boundary"] = (
+            "本轮已连接知识库并检索到真实资料；相似案例用于参考对比，仍需核验来源、年份与具体作品信息。"
+            if kb.get("knowledge_base_used")
+            else (
+                "知识库已连接，但本轮没有检索到相关案例；不以示例资料代替真实获奖证据。"
+                if kb.get("knowledge_base_connected")
+                else "本轮知识库检索服务不可用；示例案例仅用于流程演示，未作为真实获奖证据。"
+            )
+        )
+    return base
 
     for key in [f"page_{i}" for i in range(1, 8)]:
         base_page = base["pages"][key]
@@ -1142,14 +1229,16 @@ def format_report_summary(report_json: Dict[str, Any]) -> str:
         "结构化数据已保存在 payload_json 中。",
         "输入“下载报告”即可生成图文并茂的 Word 文档。",
     ]
-    if not report_json.get("knowledge", {}).get("knowledge_base_used"):
-        lines += ["", "当前尚未接入老师提供的真实获奖作品知识库；接口已预留，后续直接接入即可。"]
+
+    kb = report_json.get("knowledge", {})
+    if kb.get("knowledge_base_used"):
+        lines += ["", "知识库状态：已连接，并检索到真实资料；报告已引用相关检索结果。"]
+    elif kb.get("knowledge_base_connected"):
+        lines += ["", "知识库状态：已连接，但本轮未检索到相关案例；报告未使用示例案例作为获奖证据。"]
+    else:
+        lines += ["", "知识库状态：本轮检索服务不可用或未连通；报告未引用真实获奖案例，示例案例不作为证据。"]
     return "\n".join(lines)
 
-
-# ============================================================
-# 动态图片：项目相关概念图、结构图、流程图、创新图
-# ============================================================
 def _domain_hint(report: Dict[str, Any]) -> str:
     fields = report.get("idea_fields", {})
     raw = fields.get("raw_idea", "")
@@ -1976,6 +2065,94 @@ def _add_innovation_validation_table(doc: Document, items: Any) -> None:
     _style_table(table, header_fill="D9EAF7")
 
 
+def _add_cover_flow(doc: Document, report: Dict[str, Any]) -> None:
+    fields = report.get("idea_fields", {})
+    functions = fields.get("core_functions", []) or ["目标识别", "任务决策", "自主执行", "结果反馈"]
+    techs = fields.get("tech_modules", []) or ["视觉/传感采集", "状态识别"]
+    labels = ["感知输入", "状态识别", "任务决策", "执行服务", "结果反馈"]
+    details = [
+        "、".join(techs[:2]),
+        "、".join(functions[:1]),
+        "任务规划与安全判断",
+        "、".join(functions[1:3]) or "执行机构控制",
+        "状态确认、记录与告警",
+    ]
+    _add_heading(doc, "核心任务闭环", 2)
+    table = doc.add_table(rows=2, cols=5)
+    for i, label in enumerate(labels):
+        _set_cell_shading(table.cell(0, i), ["D9EAF7", "D9EAF7", "FFF2CC", "E2F0D9", "FCE4D6"][i])
+        _set_cell_text(table.cell(0, i), label, size=8.5, bold=True)
+        _set_cell_text(table.cell(1, i), details[i], size=7.8, align=WD_ALIGN_PARAGRAPH.CENTER)
+    _style_table(table, header_fill="D9EAF7")
+
+
+def _add_requirement_traceability_table(doc: Document, report: Dict[str, Any], content: Dict[str, Any]) -> None:
+    fields = report.get("idea_fields", {})
+    pains = [str(x) for x in content.get("pain_points", []) if str(x).strip()]
+    functions = [str(x) for x in fields.get("core_functions", []) if str(x).strip()]
+    needs = [str(x) for x in content.get("user_needs", []) if str(x).strip()]
+    metrics = report.get("pages", {}).get("page_5", {}).get("content", {}).get("engineering_metrics", [])
+    scenarios = fields.get("scenarios", []) or ["目标应用场景"]
+    row_count = max(3, min(4, max(len(pains), len(functions), len(needs))))
+    _add_heading(doc, "需求—功能—验收证据对应表", 2)
+    table = doc.add_table(rows=1, cols=3)
+    for i, label in enumerate(["用户痛点/需求", "对应设计响应", "建议验收证据"]):
+        _set_cell_shading(table.cell(0, i), "D9EAF7")
+        _set_cell_text(table.cell(0, i), label, size=8.5, bold=True)
+    for i in range(row_count):
+        pain = pains[i % len(pains)] if pains else f"场景需求 {i + 1}"
+        need = needs[i % len(needs)] if needs else "减少人工操作并提高任务连续性"
+        function = functions[i % len(functions)] if functions else "感知—决策—执行闭环"
+        metric = str(metrics[i % len(metrics)]) if metrics else "记录任务成功率、响应时延与异常处理情况"
+        response = f"{function}；{need}"
+        evidence = f"在{'、'.join(scenarios[:2])}中测试；{metric}（实际数据待测）"
+        row = table.add_row().cells
+        _set_cell_text(row[0], pain[:100], size=8.0, align=WD_ALIGN_PARAGRAPH.LEFT)
+        _set_cell_text(row[1], response[:140], size=8.0, align=WD_ALIGN_PARAGRAPH.LEFT)
+        _set_cell_text(row[2], evidence[:140], size=8.0, align=WD_ALIGN_PARAGRAPH.LEFT)
+    _style_table(table, header_fill="D9EAF7")
+
+
+def _add_application_value_table(doc: Document, report: Dict[str, Any], content: Dict[str, Any]) -> None:
+    fields = report.get("idea_fields", {})
+    scenarios = content.get("application_scenarios") or fields.get("scenarios") or ["目标场景"]
+    functions = fields.get("core_functions", []) or ["自主服务"]
+    techs = fields.get("tech_modules", []) or ["感知与控制"]
+    _add_heading(doc, "应用场景与价值验证矩阵", 2)
+    table = doc.add_table(rows=1, cols=3)
+    for i, label in enumerate(["应用场景", "主要任务", "落地验证方式"]):
+        _set_cell_shading(table.cell(0, i), "D9EAF7")
+        _set_cell_text(table.cell(0, i), label, size=8.5, bold=True)
+    for i in range(min(4, max(3, len(scenarios)))):
+        scenario = str(scenarios[i % len(scenarios)])
+        function = str(functions[i % len(functions)])
+        tech = str(techs[i % len(techs)])
+        row = table.add_row().cells
+        _set_cell_text(row[0], scenario[:80], size=8.0, align=WD_ALIGN_PARAGRAPH.LEFT)
+        _set_cell_text(row[1], f"{function}（{tech}）"[:130], size=8.0, align=WD_ALIGN_PARAGRAPH.LEFT)
+        _set_cell_text(row[2], "连续场景测试；记录成功率、响应时延、误报/漏报与人工接管次数（待实测）", size=8.0, align=WD_ALIGN_PARAGRAPH.LEFT)
+    _style_table(table, header_fill="D9EAF7")
+
+
+def _add_review_evidence_table(doc: Document) -> None:
+    _add_heading(doc, "竞赛评审证据准备清单", 2)
+    rows = [
+        ("创新性", "与常见方案对照，列明真正新增的机制与边界"),
+        ("科学性", "记录测试场景、样本规模、指标定义与原始结果"),
+        ("工程实现", "准备样机照片、模块连接、运行日志和异常恢复记录"),
+        ("应用价值", "准备目标用户、应用流程、需求来源或试点反馈"),
+    ]
+    table = doc.add_table(rows=1, cols=2)
+    for i, label in enumerate(["评审维度", "应准备的可核验证据"]):
+        _set_cell_shading(table.cell(0, i), "D9EAF7")
+        _set_cell_text(table.cell(0, i), label, size=8.5, bold=True)
+    for dimension, evidence in rows:
+        row = table.add_row().cells
+        _set_cell_text(row[0], dimension, size=8.0, bold=True)
+        _set_cell_text(row[1], evidence, size=8.0, align=WD_ALIGN_PARAGRAPH.LEFT)
+    _style_table(table, header_fill="D9EAF7")
+
+
 def _add_landing_roadmap(doc: Document, steps: List[str]) -> None:
     _add_heading(doc, "项目落地路线图", 2)
     steps = [str(s) for s in steps if str(s).strip()][:6]
@@ -2083,7 +2260,7 @@ def _render_cover(doc: Document, report: Dict[str, Any], images: Dict[str, str])
     _set_run_font(r, name="SimSun", size=13)
     p.paragraph_format.space_before = Pt(0)
     p.paragraph_format.space_after = Pt(4)
-    _add_image(doc, images.get("product"), "图1  项目产品概念效果图", 15.8)
+    _add_image(doc, images.get("product"), "图1  项目产品概念效果图", 16.8)
 
     content = report.get("pages", {}).get("page_1", {}).get("content", {})
     _add_paragraph(doc, content.get("design_statement", ""), first_line=False)
@@ -2100,6 +2277,7 @@ def _render_cover(doc: Document, report: Dict[str, Any], images: Dict[str, str])
         row.cells[0].text = k
         row.cells[1].text = str(v)
     _style_table(table, header_fill="E8EEF7")
+    _add_cover_flow(doc, report)
 
 
 def _render_page(doc: Document, report: Dict[str, Any], page_no: int, images: Dict[str, str]) -> None:
@@ -2108,7 +2286,7 @@ def _render_page(doc: Document, report: Dict[str, Any], page_no: int, images: Di
     _add_heading(doc, f"第{page_no}页  {page.get('title', '')}", 1)
 
     if page_no == 2:
-        _add_image(doc, images.get("scene"), "图2  项目典型应用场景效果图", 11.5)
+        _add_image(doc, images.get("scene"), "图2  项目典型应用场景效果图", 14.5)
         _add_heading(doc, "设计背景", 2)
         _add_paragraphs(doc, content.get("background_paragraphs") or content.get("background", []), 2)
         _add_heading(doc, "用户痛点", 2)
@@ -2117,6 +2295,7 @@ def _render_page(doc: Document, report: Dict[str, Any], page_no: int, images: Di
         _add_bullets(doc, content.get("user_needs", []), 3)
         _add_heading(doc, "设计目标", 2)
         _add_bullets(doc, content.get("design_goals", []), 3)
+        _add_requirement_traceability_table(doc, report, content)
 
     elif page_no == 3:
         _add_paragraph(doc, content.get("overview", ""))
@@ -2163,6 +2342,7 @@ def _render_page(doc: Document, report: Dict[str, Any], page_no: int, images: Di
         _add_bullets(doc, content.get("innovation_points", []), 7)
         _add_comparison_table(doc, content.get("comparison", []))
         _add_innovation_validation_table(doc, content.get("innovation_points", []))
+        _add_review_evidence_table(doc)
         diff = content.get("differentiation_analysis", {})
         note = diff.get("current_boundary") if isinstance(diff, dict) else None
         if note:
@@ -2173,6 +2353,7 @@ def _render_page(doc: Document, report: Dict[str, Any], page_no: int, images: Di
         _add_paragraphs(doc, content.get("prospect_paragraphs", []), 4)
         _add_heading(doc, "典型应用场景", 2)
         _add_bullets(doc, content.get("application_scenarios", []), 6)
+        _add_application_value_table(doc, report, content)
         _add_landing_roadmap(doc, content.get("deployment_paths", []))
         _add_heading(doc, "社会价值", 2)
         _add_bullets(doc, content.get("social_value", []), 6)
@@ -2492,6 +2673,23 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
         selected = session.get("selected_title")
         fields = session.get("fields")
         knowledge = session.get("knowledge") or {}
+        if not knowledge.get("knowledge_base_connected") and not knowledge.get("knowledge_base_used"):
+            print("KNOWLEDGE_RETRY_ON_REPORT_GENERATION:", {"session_key": session_key}, flush=True)
+            refreshed_knowledge = search_competition_knowledge(fields)
+            if refreshed_knowledge.get("knowledge_base_connected"):
+                knowledge = refreshed_knowledge
+                session["knowledge"] = knowledge
+                if knowledge.get("knowledge_base_used"):
+                    selected = dict(selected or {})
+                    selected["scores"] = score_candidate(
+                        fields, selected, knowledge, max(0, int(selected.get("id", 1)) - 1)
+                    )
+                    session["selected_title"] = selected
+                    for candidate in session.get("candidates", []):
+                        if candidate.get("id") == selected.get("id"):
+                            candidate.update(selected)
+                            break
+                save_session(session_key, session)
         if not selected or not fields:
             return response(
                 success=False,
@@ -2502,6 +2700,10 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             )
 
         report_json = build_report_json(fields, selected, knowledge)
+        report_json.setdefault("knowledge", {})["knowledge_base_connected"] = knowledge.get("knowledge_base_connected", bool(knowledge.get("knowledge_base_used")))
+        report_json["knowledge"]["knowledge_base_used"] = knowledge.get("knowledge_base_used", False)
+        report_json["knowledge"]["similar_award_cases"] = knowledge.get("similar_award_cases", [])[:5]
+        report_json["knowledge"]["knowledge_sources"] = knowledge.get("knowledge_sources", [])
         session["report_json"] = report_json
         session["report_revision"] = int(session.get("report_revision", 0)) + 1
         session["stage"] = "report_json_ready"
