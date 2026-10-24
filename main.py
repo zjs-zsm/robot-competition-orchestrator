@@ -457,12 +457,21 @@ keywords(list), pain_points(list), design_goal(str)。要求忠实于用户原�
 # 知识库接口：未来老师资料直接接这里
 # ============================================================
 def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict[str, Any]:
+    """Query the live award knowledge base without blocking the whole workflow on cold starts.
+
+    The Chaoxing task flow has a bounded execution window. Do one short health
+    probe and one bounded search request; on 429/502/timeouts, return a clearly
+    marked unavailable state and let candidate/report generation continue.
+    """
     query_parts = []
     for key in ("keywords", "core_functions", "scenarios", "pain_points"):
         values = fields.get(key, [])
         if isinstance(values, list):
             query_parts.extend(str(value).strip() for value in values if str(value).strip())
     query = " ".join(query_parts).strip()
+
+    lookup_attempted = bool(KNOWLEDGE_API_URL)
+    lookup_status = "not_configured"
 
     if KNOWLEDGE_API_URL:
         parsed_url = urllib.parse.urlsplit(KNOWLEDGE_API_URL)
@@ -478,12 +487,6 @@ def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict
         if KNOWLEDGE_API_KEY:
             headers["Authorization"] = f"Bearer {KNOWLEDGE_API_KEY}"
 
-        body = json.dumps(
-            {"query": query, "top_k": max(1, min(int(top_k), 10))},
-            ensure_ascii=False,
-        ).encode("utf-8")
-        retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
-
         print(
             "KNOWLEDGE_API_TARGET:",
             {
@@ -494,184 +497,154 @@ def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict
             flush=True,
         )
 
-        # The knowledge service is on Render's free tier and may be asleep.
-        # Probe its health endpoint first and space retries to avoid flooding
-        # Render's edge with POST requests while the service is starting.
         healthy = False
-        health_backoff_seconds = [20, 25, 30]
-        for attempt in range(1, len(health_backoff_seconds) + 2):
-            health_req = urllib.request.Request(
-                health_url,
-                headers={"User-Agent": headers["User-Agent"]},
-                method="GET",
+        health_req = urllib.request.Request(
+            health_url,
+            headers={"User-Agent": headers["User-Agent"]},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(health_req, timeout=4) as health_resp:
+                health_data = json.loads(health_resp.read().decode("utf-8"))
+            healthy = bool(
+                health_data.get("ok")
+                and health_data.get("database_ready") is not False
             )
-            try:
-                with urllib.request.urlopen(health_req, timeout=12) as health_resp:
-                    health_data = json.loads(health_resp.read().decode("utf-8"))
-
-                if health_data.get("ok") and health_data.get("database_ready") is not False:
-                    healthy = True
-                    print(
-                        "KNOWLEDGE_API_HEALTH_OK:",
-                        {
-                            "host": target_host,
-                            "database_ready": health_data.get("database_ready"),
-                            "documents": health_data.get("documents"),
-                            "chunks": health_data.get("chunks"),
-                            "attempt": attempt,
-                        },
-                        flush=True,
-                    )
-                    break
-
-                print(
-                    "KNOWLEDGE_API_NOT_READY:",
-                    {
-                        "host": target_host,
-                        "database_ready": health_data.get("database_ready"),
-                        "attempt": attempt,
-                    },
-                    flush=True,
-                )
-            except urllib.error.HTTPError as exc:
-                print(
-                    "KNOWLEDGE_API_HEALTH_HTTP_ERROR:",
-                    {"status": exc.code, "host": target_host, "attempt": attempt},
-                    flush=True,
-                )
-                if exc.code not in retryable_statuses:
-                    break
-            except Exception as exc:
-                print(
-                    "KNOWLEDGE_API_HEALTH_ERROR:",
-                    {"type": type(exc).__name__, "host": target_host, "attempt": attempt},
-                    flush=True,
-                )
-
-            if attempt < len(health_backoff_seconds) + 1:
-                time.sleep(health_backoff_seconds[attempt - 1])
+            print(
+                "KNOWLEDGE_API_HEALTH_RESULT:",
+                {
+                    "host": target_host,
+                    "healthy": healthy,
+                    "database_ready": health_data.get("database_ready"),
+                    "documents": health_data.get("documents"),
+                    "chunks": health_data.get("chunks"),
+                },
+                flush=True,
+            )
+        except urllib.error.HTTPError as exc:
+            lookup_status = "unavailable"
+            print(
+                "KNOWLEDGE_API_HEALTH_HTTP_ERROR:",
+                {"status": exc.code, "host": target_host},
+                flush=True,
+            )
+        except Exception as exc:
+            lookup_status = "unavailable"
+            print(
+                "KNOWLEDGE_API_HEALTH_ERROR:",
+                {"type": type(exc).__name__, "host": target_host},
+                flush=True,
+            )
 
         if healthy:
-            for attempt in range(1, 3):
-                req = urllib.request.Request(
-                    KNOWLEDGE_API_URL,
-                    data=body,
-                    headers=headers,
-                    method="POST",
-                )
-                try:
-                    with urllib.request.urlopen(req, timeout=22) as resp:
-                        data = json.loads(resp.read().decode("utf-8"))
+            body = json.dumps(
+                {"query": query, "top_k": max(1, min(int(top_k), 10))},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                KNOWLEDGE_API_URL,
+                data=body,
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
 
-                    raw_results = data.get("cases") or data.get("results") or []
-                    if not isinstance(raw_results, list):
-                        raw_results = []
+                raw_results = data.get("cases") or data.get("results") or []
+                if not isinstance(raw_results, list):
+                    raw_results = []
 
-                    results = []
-                    for item in raw_results[:top_k]:
-                        if not isinstance(item, dict):
-                            continue
-                        normalized = dict(item)
-                        normalized["title"] = str(
-                            item.get("title") or item.get("source") or "知识库资料"
-                        )
-                        normalized["source"] = str(
-                            item.get("source") or item.get("title") or "知识库资料"
-                        )
-                        normalized["summary"] = str(
-                            item.get("summary") or item.get("content") or item.get("text") or ""
-                        )
-                        try:
-                            normalized["similarity"] = float(item.get("similarity", 0) or 0)
-                        except (TypeError, ValueError):
-                            normalized["similarity"] = 0.0
-                        results.append(normalized)
-
-                    sources = data.get("sources") or list(
-                        dict.fromkeys(item["source"] for item in results)
+                results = []
+                for item in raw_results[:top_k]:
+                    if not isinstance(item, dict):
+                        continue
+                    normalized = dict(item)
+                    normalized["title"] = str(
+                        item.get("title") or item.get("source") or "知识库资料"
                     )
-                    if results:
-                        print(
-                            "KNOWLEDGE_SEARCH_SUCCESS:",
-                            {
-                                "result_count": len(results),
-                                "source_count": len(sources),
-                                "query_length": len(query),
-                                "host": target_host,
-                                "attempt": attempt,
-                            },
-                            flush=True,
-                        )
-                        return {
-                            "knowledge_base_connected": True,
-                            "knowledge_base_used": True,
-                            "knowledge_lookup_attempted": True,
-                            "knowledge_lookup_status": "success",
-                            "similar_award_cases": results,
-                            "knowledge_sources": sources,
-                            "source_type": "external_knowledge_base",
-                        }
+                    normalized["source"] = str(
+                        item.get("source") or item.get("title") or "知识库资料"
+                    )
+                    normalized["summary"] = str(
+                        item.get("summary") or item.get("content") or item.get("text") or ""
+                    )
+                    try:
+                        normalized["similarity"] = float(item.get("similarity", 0) or 0)
+                    except (TypeError, ValueError):
+                        normalized["similarity"] = 0.0
+                    results.append(normalized)
 
+                sources = data.get("sources") or list(
+                    dict.fromkeys(item["source"] for item in results)
+                )
+                if results:
                     print(
-                        "KNOWLEDGE_SEARCH_EMPTY:",
-                        {"query_length": len(query), "host": target_host, "attempt": attempt},
+                        "KNOWLEDGE_SEARCH_SUCCESS:",
+                        {
+                            "result_count": len(results),
+                            "source_count": len(sources),
+                            "query_length": len(query),
+                            "host": target_host,
+                        },
                         flush=True,
                     )
                     return {
                         "knowledge_base_connected": True,
-                        "knowledge_base_used": False,
+                        "knowledge_base_used": True,
                         "knowledge_lookup_attempted": True,
-                        "knowledge_lookup_status": "empty",
-                        "similar_award_cases": [],
+                        "knowledge_lookup_status": "success",
+                        "similar_award_cases": results,
                         "knowledge_sources": sources,
-                        "source_type": "external_knowledge_base_empty",
+                        "source_type": "external_knowledge_base",
                     }
 
-                except urllib.error.HTTPError as exc:
-                    retry_after = 0
-                    try:
-                        retry_after = int(exc.headers.get("Retry-After", "0"))
-                    except (TypeError, ValueError, AttributeError):
-                        retry_after = 0
-                    print(
-                        "KNOWLEDGE_SEARCH_HTTP_ERROR:",
-                        {
-                            "status": exc.code,
-                            "host": target_host,
-                            "path": target_path,
-                            "attempt": attempt,
-                            "retry_after": retry_after or None,
-                        },
-                        flush=True,
-                    )
-                    if exc.code not in retryable_statuses or attempt == 2:
-                        break
-                    time.sleep(min(max(retry_after, 20), 25))
-                except Exception as exc:
-                    print(
-                        "KNOWLEDGE_SEARCH_ERROR:",
-                        {
-                            "type": type(exc).__name__,
-                            "host": target_host,
-                            "path": target_path,
-                            "attempt": attempt,
-                        },
-                        flush=True,
-                    )
-                    if attempt == 2:
-                        break
-                    time.sleep(20)
+                print(
+                    "KNOWLEDGE_SEARCH_EMPTY:",
+                    {"query_length": len(query), "host": target_host},
+                    flush=True,
+                )
+                return {
+                    "knowledge_base_connected": True,
+                    "knowledge_base_used": False,
+                    "knowledge_lookup_attempted": True,
+                    "knowledge_lookup_status": "empty",
+                    "similar_award_cases": [],
+                    "knowledge_sources": sources,
+                    "source_type": "external_knowledge_base_empty",
+                }
+            except urllib.error.HTTPError as exc:
+                lookup_status = "unavailable"
+                print(
+                    "KNOWLEDGE_SEARCH_HTTP_ERROR:",
+                    {
+                        "status": exc.code,
+                        "host": target_host,
+                        "path": target_path,
+                    },
+                    flush=True,
+                )
+            except Exception as exc:
+                lookup_status = "unavailable"
+                print(
+                    "KNOWLEDGE_SEARCH_ERROR:",
+                    {
+                        "type": type(exc).__name__,
+                        "host": target_host,
+                        "path": target_path,
+                    },
+                    flush=True,
+                )
         else:
+            lookup_status = "unavailable"
             print(
-                "KNOWLEDGE_SEARCH_SKIPPED: health check never became ready",
+                "KNOWLEDGE_SEARCH_SKIPPED: health check unavailable or database not ready",
                 {"host": target_host, "path": target_path},
                 flush=True,
             )
-    else:
-        print("KNOWLEDGE_SEARCH_SKIPPED: KNOWLEDGE_API_URL is not configured", flush=True)
 
-    # Sample cases are for interface continuity only; never use them as real
-    # award evidence or as a similarity penalty in competitiveness scoring.
+    # Samples maintain interface continuity only. They are never real award
+    # evidence and must not be used as a similarity penalty in scoring.
     scored = []
     kws = set(fields.get("keywords", []))
     for case in REFERENCE_CASES:
@@ -683,8 +656,8 @@ def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict
     return {
         "knowledge_base_connected": False,
         "knowledge_base_used": False,
-        "knowledge_lookup_attempted": bool(KNOWLEDGE_API_URL),
-        "knowledge_lookup_status": "unavailable" if KNOWLEDGE_API_URL else "not_configured",
+        "knowledge_lookup_attempted": lookup_attempted,
+        "knowledge_lookup_status": lookup_status if lookup_attempted else "not_configured",
         "similar_award_cases": scored[:top_k],
         "knowledge_sources": [],
         "source_type": "sample_case_library",
