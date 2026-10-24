@@ -2369,6 +2369,38 @@ def health() -> Dict[str, Any]:
     return {"ok": True, "version": APP_VERSION, "time": now_iso()}
 
 
+@app.get("/api/v1/diagnostics/knowledge")
+def diagnose_knowledge() -> Dict[str, Any]:
+    """Safely verify the configured knowledge API end-to-end without exposing secrets or document contents."""
+    if not KNOWLEDGE_API_URL:
+        return {
+            "ok": False,
+            "configured": False,
+            "knowledge_base_used": False,
+            "source_type": "not_configured",
+            "returned_results": 0,
+            "message": "KNOWLEDGE_API_URL is not configured.",
+        }
+
+    fields = {
+        "keywords": ["智能小车", "机器人竞赛", "获奖项目"],
+        "core_functions": ["自主导航", "避障"],
+        "scenarios": ["校园"],
+    }
+    result = search_competition_knowledge(fields, top_k=3)
+    cases = result.get("similar_award_cases") or []
+    used = bool(result.get("knowledge_base_used"))
+    return {
+        "ok": used,
+        "configured": True,
+        "knowledge_base_used": used,
+        "source_type": result.get("source_type", "unknown"),
+        "returned_results": len(cases) if used else 0,
+        "sample_fallback": result.get("source_type") == "sample_case_library",
+        "message": "Live knowledge search succeeded." if used else "The service is configured, but live search did not return usable records; inspect Render logs for status/auth errors.",
+    }
+
+
 @app.post("/api/v1/robot-competition/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
     return handle_chat(req)
