@@ -1545,7 +1545,7 @@ def _set_cell_shading(cell, fill: str) -> None:
 
 def _set_run_font(run, name: str = "SimSun", size: float = 12, bold: bool = False) -> None:
     run.font.name = name
-    run._element.rPr.rFonts.set(qn("w:eastAsia"), name)
+    run._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), name)
     run.font.size = Pt(size)
     run.bold = bold
 
@@ -1572,7 +1572,7 @@ def _add_heading(doc: Document, text: str, level: int = 1) -> None:
 def _add_paragraph(doc: Document, text: Any, bold_prefix: Optional[str] = None, first_line: bool = True) -> None:
     if text is None or str(text).strip() == "":
         return
-    clean_text = re.sub(r"[ \\t]{2,}", " ", str(text).strip())
+    clean_text = re.sub(r" {2,}", " ", str(text).replace("\\t", " ").strip())
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     p.paragraph_format.line_spacing = 1.25
