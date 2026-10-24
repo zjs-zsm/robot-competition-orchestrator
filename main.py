@@ -16,6 +16,7 @@ import time
 import urllib.request
 import urllib.error
 import urllib.parse
+import zipfile
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -1319,52 +1320,127 @@ def _generic_image_api(prompt: str, dest: Path) -> bool:
 
 
 def _fallback_robot_illustration(report: Dict[str, Any], dest: Path, scene: bool = False) -> None:
-    """离线兜底插画：不写中文文字，避免Render缺少中文字体出现方框。"""
+    """高质量离线概念插画。无外部图片服务时也生成可嵌入Word的产品图/校园场景图。"""
     W, H = 1280, 768
-    img = Image.new("RGB", (W, H), (246, 248, 251))
+    img = Image.new("RGB", (W, H), (242, 246, 252))
     d = ImageDraw.Draw(img)
-    # environment
-    d.rectangle((0, 560, W, H), fill=(226, 232, 239))
-    d.rectangle((60, 90, 1220, 590), outline=(185, 197, 210), width=4)
-    # robot body
-    cx, cy = 650, 385
-    d.rounded_rectangle((cx-170, cy-150, cx+170, cy+135), radius=55, fill=(235, 240, 248), outline=(68, 91, 126), width=7)
-    d.rounded_rectangle((cx-115, cy-245, cx+115, cy-130), radius=45, fill=(248, 250, 253), outline=(68, 91, 126), width=7)
-    d.ellipse((cx-62, cy-210, cx-22, cy-170), fill=(70, 116, 176))
-    d.ellipse((cx+22, cy-210, cx+62, cy-170), fill=(70, 116, 176))
-    d.rounded_rectangle((cx-95, cy-70, cx+95, cy+20), radius=22, fill=(214, 225, 239), outline=(110, 130, 160), width=4)
-    d.ellipse((cx-160, cy+110, cx-80, cy+190), fill=(66, 77, 90))
-    d.ellipse((cx+80, cy+110, cx+160, cy+190), fill=(66, 77, 90))
-    # sensor rays
-    for dx in (-260, -210, 210, 260):
-        d.line((cx + (110 if dx>0 else -110), cy-180, cx+dx, cy-250), fill=(124, 151, 185), width=3)
-    # domain object cues
-    hint = _domain_hint(report)
-    if "pet care" in hint:
-        # pet bowl + cat silhouette
-        d.ellipse((200, 560, 360, 620), fill=(174, 191, 214), outline=(90, 110, 140), width=3)
-        d.polygon([(980,520),(1030,470),(1080,520)], fill=(115, 130, 150))
-        d.ellipse((940,500,1120,650), fill=(130,145,165))
-        d.polygon([(960,505),(980,455),(1015,505)], fill=(130,145,165))
-        d.polygon([(1045,505),(1080,455),(1100,510)], fill=(130,145,165))
-    elif "plant-care" in hint:
-        d.rectangle((160,540,340,670), fill=(181,149,118))
-        d.line((250,540,250,420), fill=(89,122,82), width=12)
-        d.ellipse((180,430,250,510), fill=(116,157,105)); d.ellipse((250,410,340,500), fill=(116,157,105))
-    elif "kitchen" in hint:
-        d.rectangle((100,420,360,620), fill=(203,210,218), outline=(110,120,130), width=4)
-        d.ellipse((150,450,220,520), outline=(160,80,60), width=5)
-    elif "educational" in hint:
-        d.rectangle((120,480,380,620), fill=(196,206,219), outline=(110,120,140), width=4)
-        d.rectangle((160,420,340,500), fill=(236,240,246), outline=(100,120,150), width=3)
-    if scene:
-        # add phone/status panel on right to suggest remote interaction
-        d.rounded_rectangle((1040,140,1180,390), radius=25, fill=(252,253,255), outline=(82,105,138), width=5)
-        d.ellipse((1090,170,1130,210), fill=(95,137,189))
-        for y in (245,285,325):
-            d.rounded_rectangle((1070,y,1150,y+16), radius=8, fill=(170,188,210))
-    img.save(dest, format="PNG")
+    font = ImageFont.load_default()
 
+    def gradient(top, bottom):
+        for y in range(H):
+            t = y / max(1, H - 1)
+            color = tuple(int(top[i] * (1 - t) + bottom[i] * t) for i in range(3))
+            d.line((0, y, W, y), fill=color)
+
+    def rounded(box, radius, fill, outline=None, width=1):
+        d.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=width)
+
+    def robot(cx, cy, scale=1.0, night=False):
+        def box(x1, y1, x2, y2):
+            return (int(cx + x1 * scale), int(cy + y1 * scale),
+                    int(cx + x2 * scale), int(cy + y2 * scale))
+        outline = (45, 66, 91) if not night else (29, 44, 62)
+        # soft ground shadow and rugged wheels
+        d.ellipse(box(-205, 115, 205, 205), fill=(32, 45, 62) if night else (207, 216, 228))
+        for x in (-145, 118):
+            d.ellipse(box(x-38, 65, x+38, 170), fill=(31, 39, 50), outline=(13, 19, 28), width=max(2,int(4*scale)))
+            d.ellipse(box(x-20, 83, x+20, 151), fill=(111, 127, 145), outline=(220, 228, 238), width=max(1,int(3*scale)))
+            d.ellipse(box(x-8, 96, x+8, 138), fill=(45, 57, 73))
+        # lower chassis, front bumper and shell
+        d.polygon([box(-190, 20, -130, 105)[0:2], box(-130, 105, 170, 140)[2:4],
+                   box(190, 15, 150, 100)[0:2], box(-160, -5, -190, 30)[0:2]], fill=(62, 83, 109))
+        rounded(box(-190, -15, 190, 112), int(34*scale), (211, 222, 237), outline, max(2,int(5*scale)))
+        rounded(box(-154, 0, 155, 78), int(24*scale), (236, 242, 249), (129, 151, 177), max(1,int(3*scale)))
+        # front sensor panel
+        rounded(box(-90, 18, 95, 73), int(14*scale), (48, 66, 89), (21, 34, 49), max(1,int(3*scale)))
+        d.ellipse(box(-63, 29, -31, 61), fill=(30, 38, 51), outline=(92, 173, 232), width=max(2,int(4*scale)))
+        d.ellipse(box(-54, 36, -40, 50), fill=(91, 196, 245))
+        d.ellipse(box(24, 31, 43, 50), fill=(74, 198, 255))
+        d.ellipse(box(51, 31, 70, 50), fill=(255, 91, 85))
+        # upper compute enclosure / mast
+        rounded(box(-74, -104, 76, -17), int(20*scale), (224, 232, 243), outline, max(2,int(4*scale)))
+        rounded(box(-56, -91, 58, -38), int(12*scale), (52, 72, 97), (105, 132, 162), max(1,int(3*scale)))
+        d.ellipse(box(-35, -82, 2, -45), fill=(21, 30, 43), outline=(99, 202, 255), width=max(2,int(4*scale)))
+        d.ellipse(box(-25, -73, -7, -55), fill=(74, 182, 241))
+        # 360-degree lidar and antennas
+        rounded(box(-94, -132, 94, -105), int(10*scale), (79, 103, 132), outline, max(1,int(3*scale)))
+        d.line(box(-80, -119, 80, -119), fill=(99, 221, 255), width=max(2,int(4*scale)))
+        d.ellipse(box(-12, -144, 12, -120), fill=(40, 53, 70), outline=(122, 224, 255), width=max(1,int(3*scale)))
+        d.line(box(60, -102, 88, -156), fill=(75, 103, 133), width=max(2,int(4*scale)))
+        d.ellipse(box(80, -165, 96, -149), fill=(80, 190, 255))
+        # proximity waves / headlamp
+        ray = (110, 205, 255) if night else (87, 157, 219)
+        for k in range(3):
+            pad = (k + 1) * 17
+            d.arc(box(-125-pad, -180-pad, 125+pad, 10+pad), 195, 345, fill=ray, width=max(1,int(3*scale)))
+        rounded(box(-174, 84, 174, 105), int(8*scale), (76, 98, 124), None, 1)
+        return
+
+    if scene:
+        gradient((13, 24, 48), (38, 68, 91))
+        # moon and stars
+        d.ellipse((1030, 60, 1110, 140), fill=(245, 235, 194))
+        d.ellipse((1055, 48, 1125, 118), fill=(20, 39, 65))
+        for x, y, r in [(120,90,3),(240,150,2),(430,80,3),(650,125,2),(820,70,3),(950,190,2),(1150,205,2),(535,180,2)]:
+            d.ellipse((x-r,y-r,x+r,y+r), fill=(222, 237, 255))
+        # campus buildings with lit windows
+        for x, y, w, h in [(30,240,240,300),(290,185,230,355),(850,230,190,310),(1060,275,180,265)]:
+            d.rectangle((x,y,x+w,y+h), fill=(31,48,72), outline=(82,111,145), width=3)
+            d.rectangle((x+12,y+12,x+w-12,y+45), fill=(47,70,97))
+            for wx in range(x+22,x+w-16,42):
+                for wy in range(y+65,y+h-20,55):
+                    d.rectangle((wx,wy,wx+17,wy+25), fill=(246,207,120) if (wx+wy)//7%3 else (92,143,183))
+        # trees and path
+        for x, y in [(80,510),(245,520),(545,520),(790,520),(1120,515)]:
+            d.rectangle((x-8,y-75,x+8,y+15), fill=(83,69,59))
+            for dx,dy,rx in [(-18,-76,35),(12,-95,39),(0,-125,34)]:
+                d.ellipse((x+dx-rx,y+dy-rx,x+dx+rx,y+dy+rx), fill=(33,94,83), outline=(57,131,106), width=2)
+        d.polygon([(0,580),(1280,555),(1280,768),(0,768)], fill=(66,83,99))
+        d.polygon([(480,768),(585,558),(740,558),(900,768)], fill=(103,119,132))
+        d.line((660,768,665,580), fill=(236,206,125), width=5)
+        for yy in range(610,760,45):
+            d.line((661,yy,663,yy+20), fill=(242,224,163), width=4)
+        # patrol robot in the foreground
+        robot(660, 600, 0.70, night=True)
+        # route markers and remote alert panel
+        for x,y in [(390,680),(430,650),(470,620),(510,600)]:
+            d.ellipse((x-7,y-7,x+7,y+7), fill=(84,220,255), outline=(220,248,255), width=2)
+        rounded((1030,370,1210,650), 28, (237,244,251), (117,153,190), 5)
+        rounded((1052,398,1188,432), 10, (48,68,94))
+        d.ellipse((1083,455,1155,527), fill=(224,78,70))
+        d.polygon([(1118,468),(1130,496),(1106,496)], fill=(255,255,255))
+        d.rectangle((1083,545,1156,555), fill=(110,139,170))
+        d.rectangle((1070,574,1170,584), fill=(177,193,210))
+        d.rectangle((1090,604,1150,614), fill=(91,171,219))
+        d.text((1058, 637), "ALERT SENT", fill=(45,70,98), font=font)
+        d.text((55, 36), "CAMPUS NIGHT PATROL", fill=(226,239,251), font=font)
+        d.text((55, 58), "EDGE AI  /  AUTONOMOUS NAVIGATION  /  REMOTE ALERT", fill=(156,194,224), font=font)
+    else:
+        gradient((239, 245, 253), (218, 229, 242))
+        # studio halo and floor
+        d.ellipse((300,70,980,700), fill=(232,240,250))
+        d.ellipse((220,585,1050,730), fill=(200,213,230))
+        d.ellipse((360,610,930,705), fill=(185,201,220))
+        # technical accents
+        d.rounded_rectangle((65,80,365,160), radius=18, fill=(250,252,255), outline=(174,193,214), width=2)
+        d.text((88,103), "EDGE AI  /  STM32 CONTROL", fill=(48,72,101), font=font)
+        d.rounded_rectangle((910,80,1210,160), radius=18, fill=(250,252,255), outline=(174,193,214), width=2)
+        d.text((934,103), "CAMERA  /  LiDAR  /  SONAR", fill=(48,72,101), font=font)
+        # soft sensor rays behind the rover
+        for radius in (190,245,300):
+            d.arc((640-radius,360-radius,640+radius,360+radius), 210, 330, fill=(128,173,213), width=3)
+        robot(650, 475, 1.10, night=False)
+        # floating sensor modules and callouts
+        for x,y,fill in [(250,300,(75,153,213)),(1030,300,(61,176,183)),(270,500,(236,170,71)),(1010,500,(104,132,191))]:
+            d.ellipse((x-30,y-30,x+30,y+30), fill=fill, outline=(255,255,255), width=4)
+            d.ellipse((x-10,y-10,x+10,y+10), fill=(244,249,255))
+        d.line((280,320,420,365), fill=(78,133,188), width=4)
+        d.line((1000,320,850,360), fill=(61,150,164), width=4)
+        d.line((300,500,455,490), fill=(204,146,59), width=4)
+        d.line((980,500,850,495), fill=(91,115,167), width=4)
+        d.text((60,690), "ROBOT CONCEPT  /  MODULAR SENSING  /  SAFE MOTION", fill=(54,78,106), font=font)
+
+    img.save(dest, format="PNG", optimize=True)
 
 def _image_signature(path: Path) -> Optional[List[int]]:
     """64-bit average hash，用来避免第1、2页生成几乎同一张图。"""
@@ -1871,6 +1947,12 @@ def _render_page(doc: Document, report: Dict[str, Any], page_no: int, images: Di
 
 def export_report_to_word(report_json: Dict[str, Any], session_key: str, fast_mode: bool = False) -> Dict[str, str]:
     images = generate_project_images(report_json, session_key, fast_mode=fast_mode)
+    required_images = ["product", "scene"]
+    for image_key in required_images:
+        image_path = Path(images.get(image_key, ""))
+        if not image_path.is_file() or image_path.stat().st_size < 2048:
+            raise RuntimeError(f"Required report illustration missing or too small: {image_key}")
+
     doc = _prepare_document()
     _render_cover(doc, report_json, images)
 
@@ -1882,16 +1964,46 @@ def export_report_to_word(report_json: Dict[str, Any], session_key: str, fast_mo
         f"{session_key}-{report_json.get('project_title','')}-{now_iso()}".encode("utf-8")
     ).hexdigest()[:12]
 
-    # 下载URL永远使用ASCII文件名，避免学习通/浏览器截断中文链接。
+    # ASCII filename avoids Chaoxing/browser filename parsing problems.
     filename = f"robot_competition_report_{digest}.docx"
     path = EXPORT_DIR / filename
     doc.save(path)
+
+    # Verify the .docx actually contains embedded raster images before reporting success.
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            embedded_images = [
+                name for name in archive.namelist()
+                if name.startswith("word/media/") and not name.endswith("/")
+            ]
+    except Exception as exc:
+        raise RuntimeError(f"Unable to verify generated Word document: {type(exc).__name__}") from exc
+
+    if len(embedded_images) < 2:
+        raise RuntimeError(f"Word export has only {len(embedded_images)} embedded images; expected at least 2.")
+
+    file_size = path.stat().st_size
+    project_title = str(report_json.get("project_title", ""))
+    print(
+        "WORD_EXPORT_VERIFIED:",
+        {
+            "filename": filename,
+            "project_title": project_title,
+            "embedded_images": len(embedded_images),
+            "size_bytes": file_size,
+            "fast_mode": fast_mode,
+        },
+        flush=True,
+    )
 
     return {
         "filename": filename,
         "file_path": str(path),
         "download_url": f"{PUBLIC_BASE_URL}/api/v1/robot-competition/download/{filename}",
-        "visual_mode": "fast_local_illustrations_native_diagrams" if fast_mode else ("ai_generated_strict" if (POLLINATIONS_API_KEY or IMAGE_API_URL) else "offline_fallback"),
+        "visual_mode": "offline_stylized_illustrations_plus_native_diagrams" if fast_mode else ("ai_generated_strict" if (POLLINATIONS_API_KEY or IMAGE_API_URL) else "offline_fallback"),
+        "project_title": project_title,
+        "embedded_images": len(embedded_images),
+        "size_bytes": file_size,
     }
 
 # ============================================================
@@ -2164,11 +2276,13 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             download_url = export_info["download_url"]
             report_message = (
                 format_report_summary(report_json)
-                + "\n\nWord报告已自动生成（7页，含系统框图、项目流程图等可编辑图表）。"
-                + "\n\n**下载链接：**\n"
-                + "[点击下载 Word 报告](" + download_url + ")"
-                + "\n\n如果链接无法点击，请复制以下地址：\n"
+                + "\n\nWord报告已自动生成（7页）。文档已验证包含"
+                + str(export_info.get("embedded_images", 0))
+                + "张嵌入图片，以及系统框图、软硬件功能框图和项目流程图。"
+                + "\n\nWord下载地址（请点击或复制完整地址）：\n"
                 + download_url
+                + "\n\n对应题目："
+                + str(report_json.get("project_title", ""))
             )
             return response(
                 success=True,
@@ -2311,11 +2425,12 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             stage="word_ready",
             intent=intent,
             message=(
-                "Word报告已经生成完成。\n\n"
-                "文档已按7页竞赛报告结构排版：第3页强制包含系统框图，第5页强制包含项目工作流程图，并配套AI项目效果图、软硬件功能框图、差异化对比与落地路线图。\n\n"
-                "请点击以下链接下载 .docx 文件：\n\n"
-                + "[点击下载 Word 报告](" + export_info["download_url"] + ")"
-                + "\n\n如果链接无法点击，请复制：\n" + export_info["download_url"]
+                "Word报告已经生成完成（7页，已嵌入"
+                + str(export_info.get("embedded_images", 0))
+                + "张图片）。\n\n"
+                "对应题目：" + str(report_json.get("project_title", ""))
+                + "\n\nWord下载地址（请点击或复制完整地址）：\n"
+                + export_info["download_url"]
             ),
             payload_json=json.dumps(report_json, ensure_ascii=False, indent=2),
             download_url=export_info["download_url"],
@@ -2408,7 +2523,10 @@ def chat(req: ChatRequest) -> ChatResponse:
 
 @app.get("/api/v1/robot-competition/download/{filename}")
 def download(filename: str):
-    safe = Path(filename).name
+    # Some workflow renderers incorrectly include the Markdown closing ")" in the URL.
+    # Trim only trailing punctuation; keep the .docx extension intact.
+    cleaned_filename = filename.rstrip("),;]}>""'")
+    safe = Path(cleaned_filename).name
     file_path = EXPORT_DIR / safe
     exists = file_path.exists() and file_path.is_file()
     print(
