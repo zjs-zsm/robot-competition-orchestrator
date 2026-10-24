@@ -2164,10 +2164,10 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             download_url = export_info["download_url"]
             report_message = (
                 format_report_summary(report_json)
-                + "\\n\\nWord报告已自动生成（7页，含系统框图、项目流程图等可编辑图表）。"
-                + "\\n\\n**下载链接：**\\n"
+                + "\n\nWord报告已自动生成（7页，含系统框图、项目流程图等可编辑图表）。"
+                + "\n\n**下载链接：**\n"
                 + "[点击下载 Word 报告](" + download_url + ")"
-                + "\\n\\n如果链接无法点击，请复制以下地址：\\n"
+                + "\n\n如果链接无法点击，请复制以下地址：\n"
                 + download_url
             )
             return response(
@@ -2313,9 +2313,9 @@ def handle_chat(req: ChatRequest) -> ChatResponse:
             message=(
                 "Word报告已经生成完成。\n\n"
                 "文档已按7页竞赛报告结构排版：第3页强制包含系统框图，第5页强制包含项目工作流程图，并配套AI项目效果图、软硬件功能框图、差异化对比与落地路线图。\n\n"
-                "请点击以下链接下载 .docx 文件：\\n\\n"
+                "请点击以下链接下载 .docx 文件：\n\n"
                 + "[点击下载 Word 报告](" + export_info["download_url"] + ")"
-                + "\\n\\n如果链接无法点击，请复制：\\n" + export_info["download_url"]
+                + "\n\n如果链接无法点击，请复制：\n" + export_info["download_url"]
             ),
             payload_json=json.dumps(report_json, ensure_ascii=False, indent=2),
             download_url=export_info["download_url"],
