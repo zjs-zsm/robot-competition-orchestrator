@@ -498,43 +498,54 @@ def search_competition_knowledge(fields: Dict[str, Any], top_k: int = 5) -> Dict
         )
 
         healthy = False
-        health_req = urllib.request.Request(
-            health_url,
-            headers={"User-Agent": headers["User-Agent"]},
-            method="GET",
-        )
-        try:
-            with urllib.request.urlopen(health_req, timeout=4) as health_resp:
-                health_data = json.loads(health_resp.read().decode("utf-8"))
-            healthy = bool(
-                health_data.get("ok")
-                and health_data.get("database_ready") is not False
+        health_data: Dict[str, Any] = {}
+        # Render free instances may sleep after inactivity. A sleeping service can
+        # return a transient 502 before its application has started, so retry a few
+        # times with a strict total budget instead of treating the first 502 as final.
+        for health_attempt in range(1, 4):
+            health_req = urllib.request.Request(
+                health_url,
+                headers={"User-Agent": headers["User-Agent"]},
+                method="GET",
             )
-            print(
-                "KNOWLEDGE_API_HEALTH_RESULT:",
-                {
-                    "host": target_host,
-                    "healthy": healthy,
-                    "database_ready": health_data.get("database_ready"),
-                    "documents": health_data.get("documents"),
-                    "chunks": health_data.get("chunks"),
-                },
-                flush=True,
-            )
-        except urllib.error.HTTPError as exc:
-            lookup_status = "unavailable"
-            print(
-                "KNOWLEDGE_API_HEALTH_HTTP_ERROR:",
-                {"status": exc.code, "host": target_host},
-                flush=True,
-            )
-        except Exception as exc:
-            lookup_status = "unavailable"
-            print(
-                "KNOWLEDGE_API_HEALTH_ERROR:",
-                {"type": type(exc).__name__, "host": target_host},
-                flush=True,
-            )
+            try:
+                with urllib.request.urlopen(health_req, timeout=6) as health_resp:
+                    health_data = json.loads(health_resp.read().decode("utf-8"))
+                healthy = bool(
+                    health_data.get("ok")
+                    and health_data.get("database_ready") is not False
+                )
+                print(
+                    "KNOWLEDGE_API_HEALTH_RESULT:",
+                    {
+                        "host": target_host,
+                        "healthy": healthy,
+                        "attempt": health_attempt,
+                        "database_ready": health_data.get("database_ready"),
+                        "documents": health_data.get("documents"),
+                        "chunks": health_data.get("chunks"),
+                    },
+                    flush=True,
+                )
+                if healthy:
+                    break
+                lookup_status = "unavailable"
+            except urllib.error.HTTPError as exc:
+                lookup_status = "unavailable"
+                print(
+                    "KNOWLEDGE_API_HEALTH_HTTP_ERROR:",
+                    {"status": exc.code, "host": target_host, "attempt": health_attempt},
+                    flush=True,
+                )
+            except Exception as exc:
+                lookup_status = "unavailable"
+                print(
+                    "KNOWLEDGE_API_HEALTH_ERROR:",
+                    {"type": type(exc).__name__, "host": target_host, "attempt": health_attempt},
+                    flush=True,
+                )
+            if health_attempt < 3:
+                time.sleep(2 if health_attempt == 1 else 3)
 
         if healthy:
             body = json.dumps(
