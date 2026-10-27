@@ -22,7 +22,7 @@ import zipfile
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.section import WD_SECTION
@@ -32,7 +32,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from PIL import Image, ImageDraw, ImageFont
 
-APP_VERSION = "4.1.1"
+APP_VERSION = "4.1.2"
 
 app = FastAPI(
     title="Robot Competition Orchestrator",
@@ -53,10 +53,77 @@ app.add_middleware(
 # 数据模型：保持与学习通插件现有字段兼容
 # ============================================================
 class ChatRequest(BaseModel):
-    session_id: str = Field(..., description="会话ID")
-    user_id: str = Field(..., description="用户ID")
-    message: str = Field(..., description="用户输入")
+    # Chaoxing Flow versions may send different field names or wrap values in
+    # inputs/data/payload. Defaults prevent a missing optional ID from becoming 422.
+    session_id: str = Field(default="default", description="会话ID")
+    user_id: str = Field(default="anonymous", description="用户ID")
+    message: str = Field(default="", description="用户输入")
     attachments: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_chaoxing_payload(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return {"message": value}
+        if not isinstance(value, dict):
+            return value
+
+        data = dict(value)
+        nested_sources = []
+        for key in ("inputs", "input", "payload", "data", "params", "request"):
+            nested = data.get(key)
+            if isinstance(nested, dict):
+                nested_sources.append(nested)
+            elif isinstance(nested, str) and not data.get("message"):
+                data["message"] = nested
+
+        message_keys = (
+            "message", "user_message", "userMessage", "user_input", "userInput",
+            "input_text", "inputText", "chatInput", "question", "query", "text",
+            "content", "prompt", "input",
+        )
+        for source in [data] + nested_sources:
+            if data.get("message"):
+                break
+            for key in message_keys:
+                candidate = source.get(key)
+                if candidate is not None and candidate != "":
+                    data["message"] = candidate
+                    break
+
+        session_keys = (
+            "sessionId", "conversation_id", "conversationId", "chat_id", "chatId",
+            "flow_session_id", "flowSessionId", "conversation",
+        )
+        if not data.get("session_id"):
+            for source in [data] + nested_sources:
+                for key in session_keys:
+                    if source.get(key):
+                        data["session_id"] = source[key]
+                        break
+                if data.get("session_id"):
+                    break
+
+        user_keys = ("userId", "uid", "open_id", "openid", "userOpenId", "user")
+        if not data.get("user_id"):
+            for source in [data] + nested_sources:
+                for key in user_keys:
+                    if source.get(key):
+                        data["user_id"] = source[key]
+                        break
+                if data.get("user_id"):
+                    break
+
+        if not isinstance(data.get("message"), str):
+            try:
+                data["message"] = json.dumps(data["message"], ensure_ascii=False)
+            except Exception:
+                data["message"] = str(data.get("message", ""))
+
+        data.setdefault("session_id", "default")
+        data.setdefault("user_id", "anonymous")
+        data.setdefault("attachments", [])
+        return data
 
 
 class ChatResponse(BaseModel):
@@ -770,9 +837,33 @@ def local_generate_candidates(fields: Dict[str, Any], knowledge: Dict[str, Any])
     function_text = "、".join(funcs[:3])
     tech_text = "、".join(tech[:3])
 
-    # A domain-specific fallback prevents generic titles from losing the user's
-    # key concept when the optional LLM is disabled or unavailable.
-    if contains_any(raw_idea, ["巡逻", "巡查", "校园安防", "夜间安全"]) and contains_any(
+    # Domain-specific candidates preserve short ideas instead of falling back
+    # to broad generic robot titles when optional LLM output is unavailable.
+    if contains_any(raw_idea, ["扫地机器人", "扫地", "清扫机器人", "清洁机器人", "地面清洁", "地面清扫", "拖地机器人"]):
+        candidates = [
+            {
+                "id": 1,
+                "title": "“净地先锋”——具备自主导航与智能避障的家用扫地机器人",
+                "positioning": "面向家庭地面日常清洁，完成自主移动、障碍物绕行和分区清扫，兼顾清洁覆盖率与运行安全。",
+                "core_tech": "移动底盘控制、距离传感器融合、路径规划、滚刷与吸尘机构控制",
+                "differentiator": "以稳定的自主清扫闭环和可量化覆盖率为重点",
+            },
+            {
+                "id": 2,
+                "title": "“慧扫云”——融合环境感知与分区路径规划的智能清扫机器人",
+                "positioning": "根据房间布局和障碍物分布规划清扫路线，减少重复清扫与遗漏，并记录清扫进度。",
+                "core_tech": "环境建图、路径规划、里程计定位、动态避障与清扫区域管理",
+                "differentiator": "突出清扫效率、覆盖率和路线可视化",
+            },
+            {
+                "id": 3,
+                "title": "“洁净管家”——具备边角清洁、地面识别与自动回充的家用机器人",
+                "positioning": "针对墙边、家具周围和不同地面区域优化清扫动作，低电量时返回充电位置。",
+                "core_tech": "边缘检测、地面状态识别、边刷控制、电量监测与回充引导",
+                "differentiator": "突出边角清洁能力和低电量任务闭环",
+            },
+        ]
+    elif contains_any(raw_idea, ["巡逻", "巡查", "校园安防", "夜间安全"]) and contains_any(
         raw_idea, ["校园", "高校", "宿舍", "停车", "道路"]
     ):
         candidates = [
@@ -839,6 +930,8 @@ def local_generate_candidates(fields: Dict[str, Any], knowledge: Dict[str, Any])
 
 def generate_candidates(fields: Dict[str, Any], knowledge: Dict[str, Any]) -> List[Dict[str, Any]]:
     raw_idea = fields.get("raw_idea", "")
+    if contains_any(raw_idea, ["扫地机器人", "扫地", "清扫机器人", "清洁机器人", "地面清洁", "地面清扫", "拖地机器人"]):
+        return local_generate_candidates(fields, knowledge)
     if contains_any(raw_idea, ["巡逻", "巡查", "校园安防", "夜间安全"]) and contains_any(
         raw_idea, ["校园", "高校", "宿舍", "停车", "道路"]
     ):
@@ -3161,7 +3254,54 @@ def diagnose_knowledge() -> Dict[str, Any]:
 
 @app.post("/api/v1/robot-competition/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
-    return handle_chat(req)
+    session_key = build_session_key(req)
+    message = clean_message(req.message or "")
+    print(
+        "CHAT_REQUEST_RECEIVED:",
+        {
+            "session_key": session_key,
+            "message_length": len(message),
+            "has_attachments": bool(req.attachments),
+            "request_schema": "4.1.2",
+        },
+        flush=True,
+    )
+
+    if not message:
+        print("CHAT_REQUEST_REJECTED: empty_message", flush=True)
+        return response(
+            success=False,
+            stage="input_error",
+            intent="input_error",
+            message="没有读取到机器人创意文本。请检查学习通任务流是否把用户输入映射到 message/input/query/text 字段后再执行。",
+            data={"error_code": "empty_message"},
+            suggested_actions=["重新输入完整机器人创意"],
+        )
+
+    try:
+        result = handle_chat(req)
+        print(
+            "CHAT_REQUEST_COMPLETED:",
+            {
+                "success": result.success,
+                "stage": result.stage,
+                "intent": result.intent,
+                "message_length": len(result.message or ""),
+            },
+            flush=True,
+        )
+        return result
+    except Exception as exc:
+        import traceback
+        print("CHAT_REQUEST_EXCEPTION:", repr(exc), traceback.format_exc(), flush=True)
+        return response(
+            success=False,
+            stage="error",
+            intent="error",
+            message="请求已到达机器人竞赛服务，但本轮处理失败。请重试一次；如果仍失败，请检查 Render 中 CHAT_REQUEST_EXCEPTION 对应日志。",
+            data={"error_code": "internal_error"},
+            suggested_actions=["重试本轮任务"],
+        )
 
 
 @app.get("/api/v1/robot-competition/download/{filename}")
