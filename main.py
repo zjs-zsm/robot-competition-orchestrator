@@ -21,7 +21,7 @@ import zipfile
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, model_validator
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -2649,6 +2649,44 @@ def export_report_to_word(report_json: Dict[str, Any], session_key: str, fast_mo
         raise RuntimeError(f"Word export has only {len(embedded_images)} embedded images; expected at least 2.")
 
     file_size = path.stat().st_size
+
+    # Persist a copy in the knowledge-base service's existing Neon Object Storage.
+    # Render's local /tmp filesystem is ephemeral and may be cleared on restart.
+    persistent_report_saved = False
+    if KNOWLEDGE_API_URL and KNOWLEDGE_API_KEY:
+        try:
+            parsed_kb_url = urllib.parse.urlsplit(KNOWLEDGE_API_URL)
+            persistent_url = urllib.parse.urlunsplit((
+                parsed_kb_url.scheme,
+                parsed_kb_url.netloc,
+                f"/api/v1/reports/{filename}",
+                "",
+                "",
+            ))
+            persistent_req = urllib.request.Request(
+                persistent_url,
+                data=path.read_bytes(),
+                headers={
+                    "Authorization": f"Bearer {KNOWLEDGE_API_KEY}",
+                    "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                },
+                method="PUT",
+            )
+            with urllib.request.urlopen(persistent_req, timeout=20) as persistent_resp:
+                persistent_result = json.loads(persistent_resp.read().decode("utf-8"))
+            persistent_report_saved = bool(persistent_result.get("success"))
+            print(
+                "PERSISTENT_WORD_REPORT_STATUS:",
+                {"filename": filename, "saved": persistent_report_saved, "size_bytes": file_size},
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                "PERSISTENT_WORD_REPORT_ERROR:",
+                {"filename": filename, "type": type(exc).__name__},
+                flush=True,
+            )
+
     project_title = str(report_json.get("project_title", ""))
     print(
         "WORD_EXPORT_VERIFIED:",
@@ -2670,6 +2708,7 @@ def export_report_to_word(report_json: Dict[str, Any], session_key: str, fast_mo
         "project_title": project_title,
         "embedded_images": len(embedded_images),
         "size_bytes": file_size,
+        "persistent_storage": persistent_report_saved,
     }
 
 # ============================================================
@@ -3318,7 +3357,39 @@ def download(filename: str):
         flush=True,
     )
     if not exists:
-        raise HTTPException(status_code=404, detail="File not found")
+        # Recover reports from persistent object storage after Render restarts.
+        if KNOWLEDGE_API_URL and KNOWLEDGE_API_KEY:
+            try:
+                parsed_kb_url = urllib.parse.urlsplit(KNOWLEDGE_API_URL)
+                persistent_url = urllib.parse.urlunsplit((
+                    parsed_kb_url.scheme,
+                    parsed_kb_url.netloc,
+                    f"/api/v1/reports/{safe}",
+                    "",
+                    "",
+                ))
+                req = urllib.request.Request(
+                    persistent_url,
+                    headers={"Authorization": f"Bearer {KNOWLEDGE_API_KEY}"},
+                    method="GET",
+                )
+                with urllib.request.urlopen(req, timeout=20) as upstream:
+                    raw = upstream.read()
+                print(
+                    "DEBUG_DOWNLOAD_PERSISTENT_HIT:",
+                    {"filename": safe, "size_bytes": len(raw)},
+                    flush=True,
+                )
+                return Response(
+                    content=raw,
+                    media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    headers={"Content-Disposition": f'attachment; filename="{safe}"'},
+                )
+            except urllib.error.HTTPError as exc:
+                print("DEBUG_DOWNLOAD_PERSISTENT_HTTP_ERROR:", {"filename": safe, "status": exc.code}, flush=True)
+            except Exception as exc:
+                print("DEBUG_DOWNLOAD_PERSISTENT_ERROR:", {"filename": safe, "type": type(exc).__name__}, flush=True)
+        raise HTTPException(status_code=404, detail="File not found in local or persistent storage")
     return FileResponse(
         path=str(file_path),
         filename=safe,
