@@ -717,6 +717,61 @@ def download_document(document_id: int, request: Request):
     })
 
 
+@app.put("/api/v1/reports/{filename}")
+async def store_generated_report(filename: str, request: Request):
+    """Persist generated Word reports in the existing Neon object storage bucket."""
+    if not authorized_for_search(request):
+        raise HTTPException(status_code=401, detail="未授权。")
+    safe = Path(filename).name
+    if safe != filename or not re.fullmatch(r"robot_competition_report_[A-Za-z0-9_-]+\.docx", safe):
+        raise HTTPException(status_code=400, detail="Invalid report filename.")
+    if not (OBJECT_STORAGE_ENABLED and OBJECT_STORAGE_CLIENT):
+        raise HTTPException(status_code=503, detail="Persistent object storage is not configured.")
+    raw = await request.body()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty report file.")
+    if len(raw) > 30 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Report file exceeds 30 MB.")
+    key = f"generated-reports/{safe}"
+    try:
+        OBJECT_STORAGE_CLIENT.put_object(
+            Bucket=OBJECT_STORAGE_BUCKET_NAME,
+            Key=key,
+            Body=raw,
+            ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    except Exception as exc:
+        logger.exception("Generated report persistence failed: %s", safe)
+        raise HTTPException(status_code=503, detail="Unable to persist generated report.") from exc
+    logger.info("Generated report persisted: filename=%s size_bytes=%s key=%s", safe, len(raw), key)
+    return {"success": True, "filename": safe, "size_bytes": len(raw), "storage": OBJECT_STORAGE_PROVIDER}
+
+
+@app.get("/api/v1/reports/{filename}")
+def retrieve_generated_report(filename: str, request: Request):
+    """Internal authenticated endpoint used by the orchestrator to recover reports after restarts."""
+    if not authorized_for_search(request):
+        raise HTTPException(status_code=401, detail="未授权。")
+    safe = Path(filename).name
+    if safe != filename or not re.fullmatch(r"robot_competition_report_[A-Za-z0-9_-]+\.docx", safe):
+        raise HTTPException(status_code=400, detail="Invalid report filename.")
+    if not (OBJECT_STORAGE_ENABLED and OBJECT_STORAGE_CLIENT):
+        raise HTTPException(status_code=503, detail="Persistent object storage is not configured.")
+    key = f"generated-reports/{safe}"
+    try:
+        obj = OBJECT_STORAGE_CLIENT.get_object(Bucket=OBJECT_STORAGE_BUCKET_NAME, Key=key)
+        raw = obj["Body"].read()
+    except Exception as exc:
+        logger.warning("Generated report not found or unreadable: filename=%s type=%s", safe, type(exc).__name__)
+        raise HTTPException(status_code=404, detail="Report not found in persistent storage.") from exc
+    logger.info("Generated report retrieved: filename=%s size_bytes=%s", safe, len(raw))
+    return Response(
+        content=raw,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{safe}"'},
+    )
+
+
 @app.post("/api/v1/knowledge/search")
 def knowledge_search(payload: SearchRequest, request: Request):
     if not authorized_for_search(request):
